@@ -1,0 +1,268 @@
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from viewkey_batch.web import app, downloaded_keys, pagination_info
+import viewkey_batch.web as web
+from viewkey_batch.models import VideoItem
+
+
+client = TestClient(app)
+
+
+def test_web_index_loads():
+    response = client.get("/")
+    assert response.status_code == 200
+    assert "91Fetch" in response.text
+    assert "下载所选" in response.text
+    assert "no-store" in response.headers["cache-control"]
+    assert "app.js?v=30" in response.text
+    assert "账号安全" not in response.text
+    assert "定时下载" not in response.text
+
+
+def test_ui_controls_bind_before_initial_network_load():
+    script = (web.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    select_all_binding = script.index('$("#selectAll").addEventListener')
+    initial_loader = script.index("void (async () =>", select_all_binding)
+    first_initial_request = script.index('await api("/api/config")', initial_loader)
+
+    assert select_all_binding < initial_loader < first_initial_request
+
+
+def test_web_config_exposes_categories(tmp_path, monkeypatch):
+    # 不依赖当前目录是否恰好存在 site.json，直接用仓库自带的示例配置
+    config_file = tmp_path / "site.json"
+    example = Path(__file__).resolve().parent.parent / "site.example.json"
+    config_file.write_text(example.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(web, "CONFIG_PATH", config_file)
+
+    response = client.get("/api/config")
+    assert response.status_code == 200
+    assert {"top_day", "top_month", "latest", "hot", "featured"}.issubset(response.json()["categories"])
+    assert "top_week" not in response.json()["categories"]
+
+
+def test_download_queue_accepts_another_batch_while_running(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    isolated = web.Store()
+    isolated.add(VideoItem("https://example.test/watch?viewkey=abc", "abc"))
+    isolated.add(VideoItem("https://example.test/watch?viewkey=def", "def"))
+    isolated.jobs["running"] = web.Job(id="running", kind="download", status="running", viewkeys=["abc"])
+    isolated.download_status["abc"] = {"state": "downloading", "percent": 5}
+    monkeypatch.setattr(web, "store", isolated)
+
+    class DeferredThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(web, "Thread", DeferredThread)
+    job = web.queue_download(["def"], workers=2, fragments=4)
+
+    assert job.status == "queued"
+    assert job.viewkeys == ["def"]
+    assert isolated.download_status["def"]["state"] == "queued"
+
+
+def test_download_manager_loads():
+    response = client.get("/api/downloads")
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload["counts"]) == {"queued", "downloading", "completed", "failed"}
+
+
+def test_pagination_info_reads_site_page_links():
+    html = '<a href="/v.php?page=2&category=hot">2</a><a href="/v.php?page=3">下一页</a>'
+    assert pagination_info(html, 2) == {
+        "page": 2,
+        "has_previous": True,
+        "has_next": True,
+        "last_visible_page": 3,
+    }
+
+
+def test_download_state_survives_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    first = web.Store()
+    first.download_status["abc"] = {"state": "downloading", "percent": 42}
+    first.dismissed_downloads.add("hidden")
+    first.save_state()
+
+    restored = web.Store()
+    assert restored.download_status["abc"]["state"] == "failed"
+    assert restored.download_status["abc"]["percent"] == 42
+    assert "中断" in restored.download_status["abc"]["error"]
+    assert restored.dismissed_downloads == {"hidden"}
+
+
+def test_store_merges_category_membership(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    catalog = web.Store()
+    latest = VideoItem("https://example.test/watch?viewkey=abc", "abc", title="Demo")
+    latest.add_source("latest", "https://example.test/v.php?next=watch")
+    hot = VideoItem("https://example.test/watch?viewkey=abc", "abc", thumbnail_url="thumb.jpg")
+    hot.add_source("hot", "https://example.test/v.php?category=hot")
+
+    catalog.add(latest)
+    catalog.add(hot)
+
+    merged = catalog.videos["abc"]
+    assert merged.sources == ["latest", "hot"]
+    assert merged.listing_urls == {
+        "latest": "https://example.test/v.php?next=watch",
+        "hot": "https://example.test/v.php?category=hot",
+    }
+    assert merged.title == "Demo"
+    assert merged.thumbnail_url == "thumb.jpg"
+
+
+def test_old_catalog_source_is_migrated(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    old = VideoItem("https://example.test/watch?viewkey=abc", "abc", source="latest", listing_url="/latest")
+    raw = old.to_json().replace(', "sources": ["latest"], "listing_urls": {"latest": "/latest"}', "")
+    (tmp_path / "catalog.jsonl").write_text(raw + "\n", encoding="utf-8")
+
+    restored = web.Store()
+    assert restored.videos["abc"].sources == ["latest"]
+    assert restored.videos["abc"].listing_urls == {"latest": "/latest"}
+
+
+def test_replacing_category_snapshot_removes_only_stale_membership(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    catalog = web.Store()
+    shared = VideoItem("u1", "shared")
+    shared.add_source("latest", "/latest")
+    shared.add_source("hot", "/hot")
+    stale = VideoItem("u2", "stale")
+    stale.add_source("hot", "/hot")
+    catalog.add(shared)
+    catalog.add(stale)
+
+    catalog.replace_source_membership("hot", {"shared"})
+
+    assert catalog.videos["shared"].sources == ["latest", "hot"]
+    assert "stale" not in catalog.videos
+
+
+def test_missing_completed_file_becomes_retryable(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(web, "VIDEO_DIR", tmp_path / "videos")
+    isolated = web.Store()
+    isolated.add(VideoItem("https://example.test/watch?viewkey=abc", "abc", title="Demo"))
+    isolated.download_status["abc"] = {"state": "completed", "percent": 100, "error": ""}
+    monkeypatch.setattr(web, "store", isolated)
+
+    payload = client.get("/api/downloads").json()
+
+    assert payload["downloads"][0]["state"] == "failed"
+    assert "文件不存在" in payload["downloads"][0]["error"]
+    assert isolated.download_status["abc"]["state"] == "failed"
+
+
+def test_unfinished_only_covers_download_manager_tasks(tmp_path, monkeypatch):
+    """「下载全部未完成」只看下载管理自己的任务，不把整份采集结果拉回来。"""
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(web, "VIDEO_DIR", tmp_path / "videos")
+    isolated = web.Store()
+    for key in ("failed_one", "never_queued", "dismissed_one"):
+        isolated.add(VideoItem(f"https://example.test/watch?viewkey={key}", key, title=key))
+    isolated.download_status["failed_one"] = {"state": "failed", "percent": 0, "error": "network"}
+    isolated.download_status["dismissed_one"] = {"state": "failed", "percent": 0, "error": "network"}
+    isolated.dismissed_downloads.add("dismissed_one")
+    monkeypatch.setattr(web, "store", isolated)
+
+    payload = client.get("/api/downloads/unfinished").json()
+
+    assert payload == {"viewkeys": ["failed_one"], "count": 1}
+    assert client.get("/api/downloads").json()["counts"]["failed"] == 1
+
+
+def test_removed_download_stays_hidden(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(web, "VIDEO_DIR", tmp_path / "videos")
+    isolated = web.Store()
+    isolated.add(VideoItem("https://example.test/watch?viewkey=abc", "abc", title="Demo"))
+    isolated.download_status["abc"] = {"state": "failed", "percent": 0, "error": "network"}
+    monkeypatch.setattr(web, "store", isolated)
+
+    response = client.post("/api/downloads/remove", json={"viewkeys": ["abc"]})
+
+    assert response.status_code == 200
+    assert client.get("/api/downloads").json()["downloads"] == []
+    restored = web.Store()
+    assert restored.dismissed_downloads == {"abc"}
+
+
+def test_removing_download_cancels_active_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "CATALOG_PATH", tmp_path / "catalog.jsonl")
+    monkeypatch.setattr(web, "STATE_PATH", tmp_path / "state.json")
+    isolated = web.Store()
+    isolated.download_status.update({"abc": {"state": "downloading", "percent": 12}, "def": {"state": "queued", "percent": 0}})
+    job = web.Job(id="job1", kind="download", status="running", viewkeys=["abc", "def"])
+    isolated.jobs[job.id] = job
+    monkeypatch.setattr(web, "store", isolated)
+
+    response = client.post("/api/downloads/remove", json={"viewkeys": ["abc"]})
+
+    assert response.status_code == 200
+    assert job.cancelled is True
+    assert job.status == "failed"
+    assert "abc" not in isolated.download_status
+    assert isolated.download_status["def"]["state"] == "failed"
+
+
+def test_downloaded_filter_ignores_tiny_media_shell(tmp_path, monkeypatch):
+    video_dir = tmp_path / "videos"
+    video_dir.mkdir()
+    (video_dir / "broken [bad].mp4").write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * 36)
+    (video_dir / "valid [good].mp4").write_bytes(b"\x00\x00\x00\x18ftypisom" + b"\x00" * (256 * 1024))
+    monkeypatch.setattr(web, "get_video_dir", lambda: video_dir)
+
+    assert downloaded_keys() == {"good"}
+
+
+def test_account_cookie_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(web, "COOKIES_PATH", tmp_path / "cookies.txt")
+
+    # 粘贴 Cookie 请求头格式
+    response = client.post("/api/account/cookies", json={"content": "ya0uid=abc; yao_c=sessionvalue"})
+    assert response.status_code == 200
+    assert response.json()["cookie_count"] == 2
+
+    status = client.get("/api/account").json()
+    assert status["has_cookies"] is True
+    assert status["cookie_count"] == 2
+
+    assert web.app_cookies() == {"ya0uid": "abc", "yao_c": "sessionvalue"}
+
+    response = client.delete("/api/account/cookies")
+    assert response.status_code == 200
+    assert client.get("/api/account").json()["has_cookies"] is False
+
+
+def test_account_cookies_rejects_unparsable(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(web, "COOKIES_PATH", tmp_path / "cookies.txt")
+
+    response = client.post("/api/account/cookies", json={"content": "没有等号的无效内容"})
+    assert response.status_code == 400
+
+
+def test_parse_cookie_text_supports_netscape(tmp_path, monkeypatch):
+    monkeypatch.setattr(web, "DATA_DIR", tmp_path)
+    content = "# Netscape HTTP Cookie File\n.example.test\tTRUE\t/\tFALSE\t0\tsession\tTOKEN\n"
+    assert web.parse_cookie_text(content) == {"session": "TOKEN"}
+    assert web.parse_cookie_text("a=1;b=2") == {"a": "1", "b": "2"}
+    assert web.parse_cookie_text("") == {}

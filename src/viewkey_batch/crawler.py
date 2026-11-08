@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+from collections.abc import Iterator
+from pathlib import Path
+from time import time_ns
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import logging
+
+import httpx
+
+from .http import RateLimitedClient
+from .models import SiteConfig, VideoItem
+from .parser import parse_listing, parse_video_page
+
+
+log = logging.getLogger(__name__)
+
+
+def with_page(url: str, param: str, page: int) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query[param] = str(page)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def fresh_listing_url(url: str) -> str:
+    return with_page(url, "_vkb", time_ns())
+
+
+def listing_page_url(url: str, param: str, page: int, first_page: int = 1) -> str:
+    return url if page == first_page else with_page(url, param, page)
+
+
+def to_hd_url(url: str) -> str:
+    """把普通视频页地址换成高清版地址；非视频页（不含 viewkey）原样返回。"""
+    if "viewkey=" not in url:
+        return url
+    return url.replace("view_video.php", "view_video_hd.php")
+
+
+class Crawler:
+    def __init__(self, client: RateLimitedClient, config: SiteConfig):
+        self.client = client
+        self.config = config
+
+    def crawl(self, start_url: str, max_pages: int = 0) -> Iterator[VideoItem]:
+        seen: set[str] = set()
+        page = self.config.first_page
+        while not max_pages or page < self.config.first_page + max_pages:
+            url = fresh_listing_url(listing_page_url(start_url, self.config.page_param, page, self.config.first_page))
+            log.info("抓取列表页 %s", url)
+            response = self.client.get(url)
+            response.raise_for_status()
+            items = parse_listing(response.text, str(response.url), self.config)
+            new_items = [item for item in items if item.identity not in seen]
+            if not new_items:
+                log.info("第 %d 页没有新视频，停止翻页", page)
+                break
+            for item in new_items:
+                seen.add(item.identity)
+                item.listing_page = page
+                yield item
+            page += 1
+
+    def resolve(self, item: VideoItem, prefer_hd: bool = False) -> VideoItem:
+        if prefer_hd:
+            hd_url = to_hd_url(item.page_url)
+            if hd_url != item.page_url:
+                try:
+                    response = self.client.get(hd_url)
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    # 该视频没有高清版页面，回退普通页
+                    log.info("高清页不存在，回退普通页 %s", item.page_url)
+                else:
+                    resolved = parse_video_page(response.text, str(response.url), item, self.config)
+                    if resolved.stream_url:
+                        return resolved
+                    # 高清页存在但没有视频源：站点只向 VIP 登录会话提供高清流
+                    log.info("高清页未返回视频地址（高清画质需要 VIP 登录），回退普通页 %s", item.page_url)
+        response = self.client.get(item.page_url)
+        response.raise_for_status()
+        return parse_video_page(response.text, str(response.url), item, self.config)
+
+
+def append_manifest(path: Path, item: VideoItem) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(item.to_json() + "\n")
