@@ -12,11 +12,14 @@
 
 列表会显示视频标题、封面、作者、时长、播放量和 viewkey。勾选单个视频或全选当前页即可加入下载队列，添加后仍可继续浏览和选择。下载前会解析真实 `.m3u8` 或 `.mp4` 地址，并通过 yt-dlp 实现 HLS 分片并发、失败重试和断点续传。
 
-项目主页：[https://github.com/ChaosTechDev/91Fetch](https://github.com/ChaosTechDev/91Fetch)
+本仓库基于上游项目：[https://github.com/ChaosTechDev/91Fetch](https://github.com/ChaosTechDev/91Fetch)二次修改
 
 ## 版本区别
+- 增加本地代理功能，增加自定义输入91PORN其他国内直连站点
+- 增加全站搜索，支持标题，用户名，视频ID
+- 布局修改，加入缓存设计，无缝翻页
+- 原上游项目BUG几处修复
 
-- **Windows 桌面版（本仓库与 Releases）**：解压后双击 `启动.cmd`，适合个人电脑本地运行；手动浏览分类、选择视频并加入下载队列，不包含后台定时下载、容器账号登录和 NAS 专用目录配置。
 
 ## 主要功能
 
