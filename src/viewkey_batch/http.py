@@ -111,7 +111,8 @@ class RateLimitedClient:
 
     def __enter__(self) -> "RateLimitedClient":
         if self._warmup and not self._warmed:
-            response = self.get(urljoin(self.config.base_url, f"/index.php?_vkb={time.time_ns()}"))
+            path = self.config.warmup_path or "/"
+            response = self.get(urljoin(self.config.base_url, f"{path}?_vkb={time.time_ns()}"))
             response.raise_for_status()
             self._warmed = True
         return self
@@ -128,8 +129,8 @@ class RateLimitedClient:
         if delay > 0:
             time.sleep(delay)
 
-    def get(self, url: str) -> httpx.Response:
-        return self._request("GET", url)
+    def get(self, url: str, headers: dict | None = None) -> httpx.Response:
+        return self._request("GET", url, headers=headers)
 
     def post(self, url: str, data: dict | None = None, headers: dict | None = None) -> httpx.Response:
         return self._request("POST", url, data=data, headers=headers)

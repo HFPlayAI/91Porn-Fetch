@@ -7,9 +7,9 @@
   <script>
     document.documentElement.dataset.theme = localStorage.getItem("viewkey-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=30">
+  <link rel="stylesheet" href="/static/styles.css?v=38">
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/static/app.js?v=30" defer></script>
+  <script src="/static/app.js?v=38" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -80,6 +80,10 @@
           <div class="job-icon"><i data-lucide="activity"></i></div>
           <div><strong id="jobTitle">暂无运行任务</strong><span id="jobMessage">采集或下载任务会显示在这里</span></div>
           <div class="progress-track"><span id="jobProgress"></span></div>
+          <div class="job-actions">
+            <button type="button" id="pauseDownloadsButton" disabled title="暂停下载，已下载的部分会保留，继续时从断点接着下"><i data-lucide="pause"></i><span>暂停</span></button>
+            <button type="button" id="resumeDownloadsButton" disabled title="继续已暂停的下载，从 .part 断点续传"><i data-lucide="play"></i><span>继续</span></button>
+          </div>
         </div>
       </div>
     </aside>
@@ -127,8 +131,10 @@
 
       <div id="downloadsView" class="hidden">
         <div class="download-summary">
+          <div><span>全部任务</span><strong id="totalTaskCount">0</strong></div>
           <div><span>正在下载</span><strong id="downloadingCount">0</strong></div>
           <div><span>等待中</span><strong id="queuedCount">0</strong></div>
+          <div><span>已暂停</span><strong id="pausedCount">0</strong></div>
           <div><span>已完成</span><strong id="completedCount">0</strong></div>
           <div><span>失败</span><strong id="failedCount">0</strong></div>
           <div class="disk-usage"><span>已占空间</span><strong id="totalDiskUsage">0 B</strong></div>
@@ -136,7 +142,7 @@
         <div class="download-selection-bar">
           <label class="check-control"><input type="checkbox" id="selectAllDownloads"><span></span>全选任务</label>
           <div class="selection-count">已选择 <strong id="selectedDownloadCount">0</strong> 项</div>
-          <button class="ghost-button" id="downloadMissingButton" title="只续传下载管理里未完成的任务"><i data-lucide="list-restart"></i><span>下载全部未完成</span><b class="ghost-badge" id="downloadMissingCount">0</b></button>
+          <button class="ghost-button" id="downloadMissingButton" title="把下载管理里失败或已暂停的任务排入队列；同时下载数按设置中心的「并行下载数」，其余按顺序等待，排队中和正在下载的不会重复提交"><i data-lucide="list-restart"></i><span>下载全部未完成</span><b class="ghost-badge" id="downloadMissingCount">0</b></button>
           <button class="ghost-button" id="retryAllButton" disabled><i data-lucide="rotate-ccw"></i><span>重试失败</span></button>
           <button class="ghost-button" id="downloadSelectedButton" disabled><i data-lucide="download"></i><span>下载所选</span></button>
           <button class="ghost-button danger" id="removeDownloadsButton" disabled title="移除任务，不删除本地视频文件"><i data-lucide="trash-2"></i><span>删除任务</span></button>
@@ -179,14 +185,22 @@
           </section>
 
           <section class="settings-section" id="settingsSites">
-            <div class="settings-section-heading"><div><h2>站点列表</h2><p>添加 91PORN 的其他站点地址，之后可在列表里直接切换当前生效的站点。</p></div></div>
+            <div class="settings-section-heading"><div><h2>站点列表</h2><p>添加 91PORN 的其他站点地址，之后可在列表里直接切换当前生效的站点。每个站点各自保存一套抓取规则，切换时一并生效。</p></div></div>
             <div class="site-list" id="siteList"></div>
             <div class="site-add-row">
               <label class="settings-field site-name-field" for="siteNameInput"><span>备注名（可选）</span><input id="siteNameInput" placeholder="例如 备用站 A" autocomplete="off"></label>
               <label class="settings-field site-url-field" for="siteUrlInput"><span>站点地址</span><input id="siteUrlInput" placeholder="例如 https://example.com" autocomplete="off"></label>
+              <label class="settings-field site-profile-field" for="siteProfileSelect">
+                <span>抓取规则</span>
+                <select id="siteProfileSelect">
+                  <option value="">自动识别</option>
+                  <option value="classic">91porn 系</option>
+                  <option value="pinse">91pinse 系</option>
+                </select>
+              </label>
               <button class="ghost-button site-add-button" id="addSiteButton" type="button"><i data-lucide="plus"></i><span>添加站点</span></button>
             </div>
-            <p class="field-note site-note">填域名即可，也可直接粘贴完整地址（路径会被忽略）。视频页、分类页、登录页等路径沿用当前解析规则；切换站点后已采集的条目会按新域名重新对齐。</p>
+            <p class="field-note site-note">填域名即可，也可直接粘贴完整地址（路径会被忽略）。<strong>91porn 系</strong>：视频页形如 <code>/view_video.php?viewkey=…</code>，直链内联在页面里。<strong>91pinse 系</strong>：视频页形如 <code>/v/475058</code>，需要再调播放接口取 m3u8。选「自动识别」时按域名判断，判断不出来就用 91porn 系。切换站点后已采集的条目会按新域名重新对齐。</p>
           </section>
 
           <section class="settings-section" id="settingsProxy">
@@ -206,10 +220,13 @@
             <div class="settings-grid storage-settings-grid">
               <label class="settings-field settings-wide" for="settingDownloadDir"><span>下载目录</span><input id="settingDownloadDir" placeholder="例如 downloads/videos"></label>
               <label class="settings-field" for="settingFolderMode"><span>归档方式</span><select id="settingFolderMode"><option value="flat">直接保存到目录</option><option value="date">按日期建文件夹</option><option value="category">按分类建文件夹</option><option value="date_category">按日期和分类</option></select></label>
-              <label class="settings-field" for="settingWorkers"><span>并行任务数</span><input id="settingWorkers" type="number" min="1" max="8"></label>
-              <label class="settings-field" for="settingFragments"><span>单任务分片数</span><input id="settingFragments" type="number" min="1" max="16"></label>
+              <label class="settings-field" for="settingWorkers"><span>并行下载数（同时下几个视频）</span><input id="settingWorkers" type="number" min="1" max="8"></label>
+              <label class="settings-field" for="settingFragments"><span>单任务分片数（仅 HLS/DASH 生效）</span><input id="settingFragments" type="number" min="1" max="16"></label>
               <label class="check-control settings-wide" title="优先解析高清版视频页；站点的高清画质需要 VIP 账号登录（命令行可用 Cookie），无权限时自动回退普通画质"><input id="settingPreferHd" type="checkbox"><span></span><span>优先获取高清视频（需 VIP 登录）</span></label>
             </div>
+            <p class="field-note proxy-note">「并行下载数」是<strong>全局上限</strong>：「下载所选」「下载全部未完成」「继续下载」三个入口共用它。设成 2 就只有 2 个任务真正在下载，其余按加入顺序排队，前一个下完才补下一个；程序启动时不会自动开始任何下载，全部由你手动触发。</p>
+            <p class="field-note proxy-note">站点视频是单文件 MP4 直链。实测走代理时，单条连接会先给 <strong>1.5–5.5 MB/s</strong> 的突发速度，传了 25–50 MB（约 20–30 秒）后会被 CDN 压到 200 KB/s 以下甚至直接掐断；同一个出口 IP 同时开第二路时，第二路往往只能分到极少带宽。所以并发不是越大越好：<strong>2 路最稳</strong>，被冷落的那条会自动让出位置排队，等前一条断了再接着下。「单任务分片数」只对 HLS/DASH 分片视频有效，这类直链用不上。</p>
+            <p class="field-note proxy-note"><strong>注意：并发开太高会被站点限速。</strong>站点在 Cloudflare 后面，同一出口 IP 短时间内请求过多会被压到几十 KB/s，甚至返回 <code>403 error 1106</code>（IP 被临时封禁，约 1–2 分钟自动解除）。遇到速度突然掉到几十 KB/s，先把「并行下载数」降到 2，或换一个代理节点（换出口 IP）再试。掉速时也可以看 <code>downloads/app.log</code>，里面记录了每条任务的重连次数、用时和失败原因。</p>
           </section>
 
           <section class="settings-section" id="settingsRefresh">

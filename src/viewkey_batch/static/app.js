@@ -12,6 +12,9 @@ const state = {
   downloadedKeys: new Set(),
   downloads: [],
   downloadCounts: {},
+  // 下载队列汇总（正在下载数 / 排队数 / 总速度），供左下角卡片显示
+  downloadActive: null,
+  job: null,
   settings: null,
   downloadPollTimer: null,
   selected: new Set(),
@@ -152,7 +155,7 @@ function readRoute() {
 }
 
 function stateText(status) {
-  const labels = {queued: "等待下载", downloading: "正在下载", completed: "下载完成", failed: "下载失败"};
+  const labels = {queued: "等待下载", downloading: "正在下载", completed: "下载完成", failed: "下载失败", paused: "已暂停"};
   return labels[status?.state] || "";
 }
 
@@ -259,7 +262,7 @@ function downloadsMatchingFilter(filter) {
 }
 
 function updateDownloadSidebar(counts) {
-  const pending = counts.queued + counts.downloading + counts.failed;
+  const pending = counts.queued + counts.downloading + counts.failed + (counts.paused || 0);
   $("#filterPendingBadge").textContent = pending;
   $("#filterCompletedBadge").textContent = counts.completed;
   $("#filterFailedBadge").textContent = counts.failed;
@@ -270,13 +273,20 @@ function updateDownloadSidebar(counts) {
 
 function renderDownloads(totalSize = 0) {
   const visibleDownloads = downloadsMatchingFilter(state.downloadFilter);
-  const counts = {queued: 0, downloading: 0, completed: 0, failed: 0, ...state.downloadCounts};
+  const counts = {queued: 0, downloading: 0, completed: 0, failed: 0, paused: 0, ...state.downloadCounts};
+  $("#totalTaskCount").textContent = counts.queued + counts.downloading + counts.paused + counts.completed + counts.failed;
   $("#queuedCount").textContent = counts.queued;
   $("#downloadingCount").textContent = counts.downloading;
   $("#completedCount").textContent = counts.completed;
   $("#failedCount").textContent = counts.failed;
+  const pausedNode = $("#pausedCount");
+  if (pausedNode) pausedNode.textContent = counts.paused;
+  // 正在下载的永远不超过设置里的并行数，把上限写在提示里，免得以为卡住了
+  const limit = Number(state.settings?.workers || 2);
+  $("#downloadingCount").parentElement.title = `同时最多下载 ${limit} 个任务（设置中心 · 并行下载数），其余按顺序排队`;
   $("#retryAllButton").disabled = counts.failed === 0;
-  const unfinished = counts.queued + counts.downloading + counts.failed;
+  // 徽标统计「现在点一下会入队多少条」：失败 + 已暂停，与后端 /api/downloads/unfinished 一致
+  const unfinished = counts.failed + counts.paused;
   $("#downloadMissingCount").textContent = unfinished;
   $("#downloadMissingButton").disabled = unfinished === 0;
   $("#totalDiskUsage").textContent = formatBytes(totalSize);
@@ -307,7 +317,7 @@ function renderDownloads(totalSize = 0) {
       <div class="download-thumb"><img src="${escapeHtml(thumbUrl(item.thumbnail_url))}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.classList.add('is-hidden')"></div>
       <div class="download-info">
         <strong class="download-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title || item.viewkey)}</strong>
-        <span class="download-meta"><span class="meta-file"></span><span class="meta-sep" hidden>·</span><span class="meta-size"></span><span class="meta-sep" hidden>·</span><span class="meta-extra"></span></span>
+        <span class="download-meta"><span class="meta-size"></span><span class="meta-sep" hidden>·</span><span class="meta-duration"></span><span class="meta-sep" hidden>·</span><span class="meta-extra"></span></span>
         <div class="row-progress"><span style="width:${item.percent || 0}%"></span></div>
       </div>
       <div class="download-side">
@@ -325,16 +335,30 @@ function renderDownloads(totalSize = 0) {
     row.classList.toggle("hidden", !visibleDownloads.some(entry => entry.viewkey === item.viewkey));
     row.classList.toggle("failed", item.state === "failed");
     row.querySelector(".download-checkbox").checked = state.downloadSelected.has(item.viewkey);
-    const metaFile = row.querySelector(".meta-file");
-    metaFile.textContent = item.file_name || "等待生成文件";
     const metaSize = row.querySelector(".meta-size");
+    const metaDuration = row.querySelector(".meta-duration");
     const metaExtra = row.querySelector(".meta-extra");
     const separators = row.querySelectorAll(".meta-sep");
-    const extraText = item.state === "downloading" && item.speed ? item.speed : item.state === "failed" && item.error ? item.error : "";
-    metaSize.textContent = item.file_size ? formatBytes(item.file_size) : "";
+    // 元信息固定三段：文件大小 · 视频时长 · 下载速度（失败时换成失败原因）。
+    // 之前这里第一段是文件名，任务一开始下就显示「等待生成文件」，第二段才是大小，
+    // 第三段直接搬了 yt-dlp 带 ANSI 颜色码的速度串，页面上露出 [0;32m 这种乱码。
+    const total = Number(item.file_size || 0);
+    const done = Number(item.downloaded_bytes || 0);
+    const sizeText = total
+      ? (item.state === "downloading" && done > 0 && done < total
+        ? `${formatBytes(done)} / ${formatBytes(total)}`
+        : formatBytes(total))
+      : "";
+    metaSize.textContent = sizeText;
+    metaSize.title = total ? `文件大小 ${formatBytes(total)}${item.file_name ? `（${item.file_name}）` : ""}` : "";
+    metaDuration.textContent = item.duration ? `时长 ${item.duration}` : "";
+    const extraText = item.state === "downloading" && item.speed_bps
+      ? formatSpeed(item.speed_bps)
+      : item.state === "failed" && item.error ? item.error : "";
     metaExtra.textContent = extraText;
+    metaExtra.title = extraText;
     metaExtra.classList.toggle("is-error", item.state === "failed" && Boolean(item.error));
-    let parts = [metaFile.textContent, metaSize.textContent, extraText].filter(Boolean).length;
+    let parts = [metaSize.textContent, metaDuration.textContent, extraText].filter(Boolean).length;
     let shown = 0;
     separators.forEach(sep => { shown += 1; sep.hidden = shown >= parts; });
     const stateNode = row.querySelector(".download-state");
@@ -378,6 +402,8 @@ function renderDownloads(totalSize = 0) {
     });
   });
   if (window.lucide) lucide.createIcons();
+  // 下载队列一刷新，左下角卡片同步更新（频率跟随设置里的界面刷新秒数）
+  renderJobDock();
 }
 
 function formatAge(seconds) {
@@ -484,6 +510,7 @@ async function loadDownloads() {
     const data = await api("/api/downloads");
     state.downloads = data.downloads;
     state.downloadCounts = data.counts;
+    state.downloadActive = data.active || null;
     state.downloadedKeys = new Set(data.downloads.filter(item => item.state === "completed").map(item => item.viewkey));
     data.downloads.forEach(item => { state.statuses[item.viewkey] = item; });
     renderDownloads(data.total_size);
@@ -632,6 +659,11 @@ function bindAccountControls() {
   });
 }
 
+// 三个「开始下载」入口共用同一个上限：设置中心里的并行下载数
+function downloadLimit() {
+  return Math.max(1, Math.min(8, Number(state.settings?.workers || 2)));
+}
+
 async function downloadSelectedTasks() {
   const keys = [...state.downloadSelected];
   if (!keys.length) return;
@@ -642,6 +674,10 @@ async function downloadSelectedTasks() {
       body: JSON.stringify({viewkeys: keys, workers: settings.workers || 2, fragments: settings.fragments || 4}),
     });
     state.downloadSelected.clear();
+    const queued = job.total ?? keys.length;
+    toast(job.skipped
+      ? `已加入 ${queued} 个，跳过 ${job.skipped} 个已在队列中的任务；同时下 ${downloadLimit()} 个`
+      : `已加入 ${queued} 个下载任务，同时下 ${downloadLimit()} 个，其余排队`);
     watchJob(job);
   } catch (error) { toast(error.message, true); }
 }
@@ -660,6 +696,15 @@ function collectSettings() {
 
 // ---- 站点列表 ----
 
+// 规则模板的短标签：站点列表一行放不下完整说明，这里只标「哪一套规则」
+const SITE_PROFILE_SHORT = {classic: "91porn 系", pinse: "91pinse 系"};
+
+function profileBadge(site) {
+  const label = SITE_PROFILE_SHORT[site.profile];
+  if (!label) return "";
+  return `<span class="site-badge profile" title="${escapeHtml(site.profile_label || label)}">${escapeHtml(label)}</span>`;
+}
+
 function renderSites(data) {
   state.sites = data.sites || [];
   state.activeSiteId = data.active_id || "";
@@ -676,6 +721,7 @@ function renderSites(data) {
             <strong>${escapeHtml(site.name || site.base_url)}</strong>
             <span>${escapeHtml(site.base_url)}</span>
           </div>
+          ${profileBadge(site)}
           ${active ? '<span class="site-badge">当前</span>' : ""}
           <button class="icon-button delete-site" type="button" title="删除站点"><i data-lucide="trash-2"></i></button>
         </div>`;
@@ -697,7 +743,7 @@ function renderSiteMenu() {
       <span class="check-slot">${site.id === state.activeSiteId ? '<i data-lucide="check"></i>' : ""}</span>
       <span class="site-menu-item-body">
         <strong>${escapeHtml(site.name || site.base_url)}</strong>
-        <span>${escapeHtml(site.base_url)}</span>
+        <span>${escapeHtml(site.base_url)}${SITE_PROFILE_SHORT[site.profile] ? ` · ${escapeHtml(SITE_PROFILE_SHORT[site.profile])}` : ""}</span>
       </span>
     </button>`).join("") + `<div class="site-menu-foot">
       <button type="button" id="manageSitesButton"><i data-lucide="settings-2"></i>管理站点列表</button>
@@ -712,6 +758,17 @@ async function loadSites() {
 }
 
 async function switchSite(siteId) {
+  const target = state.sites.find(site => site.id === siteId);
+  const current = state.sites.find(site => site.id === state.activeSiteId);
+  // 两套规则的视频页地址互不相认，切过去以后旧条目只能靠回源校正，
+  // 结构不同的站点基本校正不回来，先提醒一句
+  if (target && current && target.profile !== current.profile) {
+    const name = target.name || target.base_url;
+    if (!confirm(`「${name}」用的是另一套抓取规则（${SITE_PROFILE_SHORT[target.profile] || target.profile}）。\n\n切换后新采集的条目按该站规则解析；之前从 ${SITE_PROFILE_SHORT[current.profile] || current.profile} 采集的条目仍然指向原站点，下载会失败，切回去才能继续。要继续吗？`)) {
+      renderSites({sites: state.sites, active_id: state.activeSiteId});
+      return;
+    }
+  }
   try {
     const data = await api("/api/sites/active", {method: "POST", body: JSON.stringify({site_id: siteId})});
     renderSites(data);
@@ -719,8 +776,28 @@ async function switchSite(siteId) {
     toast(`已切换到 ${data.site.name}`);
     state.page = 1;
     state.selected.clear();
+    await refreshSiteConfig();
     await loadCatalog();
   } catch (error) { toast(error.message, true); await loadSites(); }
+}
+
+// 当前站点支持哪些栏目 / 用哪套规则：切站点后重新拉一遍，把没有的栏目置灰
+async function refreshSiteConfig() {
+  try {
+    const config = await api("/api/config");
+    if (config.base_url) $("#siteHost").textContent = new URL(config.base_url).host;
+    applyCategoryAvailability(config.categories);
+  } catch (_) { /* 拿不到就维持现状，不打断采集流程 */ }
+}
+
+function applyCategoryAvailability(categories) {
+  const allowed = new Set(categories || []);
+  document.querySelectorAll("#categorySection .category-item").forEach(button => {
+    const ok = !allowed.size || allowed.has(button.dataset.category);
+    button.classList.toggle("disabled", !ok);
+    button.disabled = !ok;
+    button.title = ok ? "" : "当前站点没有这个栏目";
+  });
 }
 
 function closeSiteMenu() {
@@ -762,10 +839,15 @@ async function addSite() {
   try {
     const data = await api("/api/sites", {
       method: "POST",
-      body: JSON.stringify({name: $("#siteNameInput").value.trim(), base_url: baseUrl}),
+      body: JSON.stringify({
+        name: $("#siteNameInput").value.trim(),
+        base_url: baseUrl,
+        profile: $("#siteProfileSelect") ? $("#siteProfileSelect").value : "",
+      }),
     });
     $("#siteNameInput").value = "";
     $("#siteUrlInput").value = "";
+    if ($("#siteProfileSelect")) $("#siteProfileSelect").value = "";
     renderSites(data);
     toast("站点已保存");
   } catch (error) { toast(error.message, true); }
@@ -778,10 +860,11 @@ async function removeSite(siteId, name) {
     const data = await api(`/api/sites/${encodeURIComponent(siteId)}`, {method: "DELETE"});
     renderSites(data);
     toast("站点已移除");
-    // 删掉的是当前站点时，后端会自动切到第一个站点，目录要按新域名重新加载
+    // 删掉的是当前站点时，后端会自动切到第一个站点，目录和栏目都要按新站点重新加载
     if (data.active_id !== previousActive) {
       state.page = 1;
       state.selected.clear();
+      await refreshSiteConfig();
       await loadCatalog();
     }
   } catch (error) { toast(error.message, true); }
@@ -859,15 +942,77 @@ function applySettingsSection() {
   });
 }
 
-function setJob(job) {
+function formatSpeed(bytesPerSecond) {
+  const value = Number(bytesPerSecond) || 0;
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+  const index = Math.min(Math.floor(Math.log(Math.max(value, 1)) / Math.log(1024)), units.length - 1);
+  return `${(value / 1024 ** index).toFixed(index >= 2 ? 1 : 0)} ${units[index]}`;
+}
+
+// 左下角卡片：优先反映真实下载队列，而不是只看本页发起的那个任务。
+// 刷新页面、或程序启动时自动续传的任务，之前完全看不到（一直显示「暂无运行任务」）。
+function renderJobDock() {
   const panel = $("#jobPanel");
-  panel.classList.remove("empty");
-  $("#jobTitle").textContent = job.kind === "crawl" ? "采集任务" : "下载任务";
-  $("#jobMessage").textContent = job.error || job.message;
-  const percent = job.total ? Math.round(job.current * 100 / job.total) : (job.status === "completed" ? 100 : 35);
-  $("#jobProgress").style.width = `${percent}%`;
+  if (!panel) return;
+  const active = state.downloadActive || {count: 0, downloading: 0, queued: 0, speed_bps: 0, percent: 0};
+  const paused = (state.downloadCounts && state.downloadCounts.paused) || 0;
+  const job = state.job;
+  const running = job && ["queued", "running"].includes(job.status);
+  const pauseButton = $("#pauseDownloadsButton");
+  if (pauseButton) pauseButton.disabled = active.count === 0;
+  const resumeButton = $("#resumeDownloadsButton");
+  if (resumeButton) resumeButton.disabled = paused === 0;
+
+  if (job && job.kind === "crawl" && running) {
+    panel.classList.remove("empty");
+    $("#jobTitle").textContent = "采集任务";
+    $("#jobMessage").textContent = job.error || job.message;
+    const percent = job.total ? Math.round(job.current * 100 / job.total) : 35;
+    $("#jobProgress").style.width = `${percent}%`;
+    return;
+  }
+
+  if (active.count) {
+    panel.classList.remove("empty");
+    const percent = Math.round(active.percent || 0);
+    $("#jobTitle").textContent = active.downloading
+      ? `正在下载 ${active.downloading} 个任务`
+      : `排队等待 ${active.queued} 个任务`;
+    const speed = active.downloading ? formatSpeed(active.speed_bps) : "0 KB/s";
+    $("#jobMessage").textContent = active.downloading && active.queued
+      ? `${speed} · 排队 ${active.queued} 个 · 整体 ${percent}%`
+      : `${speed} · 整体 ${percent}%`;
+    $("#jobProgress").style.width = `${percent}%`;
+    return;
+  }
+
+  if (job) {
+    panel.classList.remove("empty");
+    $("#jobTitle").textContent = job.kind === "crawl" ? "采集任务" : "下载任务";
+    $("#jobMessage").textContent = job.error || job.message;
+    $("#jobProgress").style.width = job.status === "completed" ? "100%" : "0%";
+    return;
+  }
+
+  if (paused) {
+    panel.classList.remove("empty");
+    $("#jobTitle").textContent = `已暂停 ${paused} 个任务`;
+    $("#jobMessage").textContent = "点「继续」从断点接着下载";
+    $("#jobProgress").style.width = "0%";
+    return;
+  }
+
+  panel.classList.add("empty");
+  $("#jobTitle").textContent = "暂无运行任务";
+  $("#jobMessage").textContent = "采集或下载任务会显示在这里";
+  $("#jobProgress").style.width = "0%";
+}
+
+function setJob(job) {
+  state.job = job;
+  renderJobDock();
   const crawlButton = $("#crawlButton");
-  if (crawlButton) crawlButton.disabled = job.status === "queued" || job.status === "running";
+  if (crawlButton && job.kind === "crawl") crawlButton.disabled = job.status === "queued" || job.status === "running";
 }
 
 function watchJob(job) {
@@ -883,11 +1028,11 @@ function watchJob(job) {
         if (!["completed", "failed"].includes(current.status)) await refreshCatalogFromStore();
       }
       else await loadDownloads();
-      if (["completed", "failed"].includes(current.status)) {
+      if (["completed", "failed", "paused"].includes(current.status)) {
         clearInterval(state.jobTimer);
         const crawlButton = $("#crawlButton");
         if (crawlButton) crawlButton.disabled = false;
-        if (current.kind === "crawl") await loadCatalog({refresh: true});
+        if (current.kind === "crawl" && current.status !== "paused") await loadCatalog({refresh: true});
         await loadDownloads();
         toast(current.error || current.message, current.status === "failed");
       }
@@ -1090,16 +1235,38 @@ document.addEventListener("DOMContentLoaded", () => {
   $("#downloadSelectedButton").addEventListener("click", downloadSelectedTasks);
   $("#downloadMissingButton").addEventListener("click", async () => {
     try {
-      // 只续传下载管理里「未完成」的任务；已删除的任务和从没进过队列的采集结果不会被拉回来
+      // 只续传下载管理里「待续传」的任务；排队中和正在下载的由后端单独返回，不重复提交
       const data = await api("/api/downloads/unfinished");
-      if (!data.count) return toast("下载管理里没有未完成的任务");
-      if (!confirm(`将重新下载下载管理里的 ${data.count} 个未完成任务，继续？`)) return;
+      if (!data.count) {
+        if (data.active_count) return toast(`当前还有 ${data.active_count} 个任务在下载中，等它们跑完再试`);
+        return toast("下载管理里没有未完成的任务");
+      }
+      if (!confirm(`将排入下载队列 ${data.count} 个未完成任务（失败或已暂停），同时下载 ${downloadLimit()} 个，其余按顺序等待。继续？`)) return;
       const job = await api("/api/downloads", {
         method: "POST",
         body: JSON.stringify({viewkeys: data.viewkeys, workers: state.settings?.workers || 2, fragments: state.settings?.fragments || 4}),
       });
-      toast(`已加入 ${job.total ?? data.count} 个下载任务`);
+      const queued = job.total ?? data.count;
+      toast(job.skipped
+        ? `已加入 ${queued} 个，跳过 ${job.skipped} 个已在队列中的任务；同时下 ${downloadLimit()} 个`
+        : `已加入 ${queued} 个，同时下 ${downloadLimit()} 个，其余排队`);
       watchJob(job);
+    } catch (error) { toast(error.message, true); }
+  });
+  $("#pauseDownloadsButton").addEventListener("click", async () => {
+    try {
+      const data = await api("/api/downloads/pause", {method: "POST"});
+      toast(data.paused ? `已暂停 ${data.paused} 个下载任务，已下载部分保留` : "当前没有正在进行的下载");
+      await loadDownloads();
+    } catch (error) { toast(error.message, true); }
+  });
+  $("#resumeDownloadsButton").addEventListener("click", async () => {
+    try {
+      const data = await api("/api/downloads/resume", {method: "POST"});
+      if (!data.job) return toast("没有已暂停的任务");
+      toast(`已排入 ${data.resumed} 个任务，同时下 ${downloadLimit()} 个，从断点接着下`);
+      watchJob(data.job);
+      await loadDownloads();
     } catch (error) { toast(error.message, true); }
   });
   $("#retryAllButton").addEventListener("click", async () => {
@@ -1128,7 +1295,7 @@ document.addEventListener("DOMContentLoaded", () => {
       watchJob(job);
       state.selected.clear();
       render();
-      toast(`已加入 ${job.total || 0} 个下载任务，可继续选择视频`);
+      toast(`已加入 ${job.total || 0} 个下载任务，同时下 ${downloadLimit()} 个，可继续选择视频`);
     } catch (error) { toast(error.message, true); }
   });
 
@@ -1146,13 +1313,15 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       const config = await api("/api/config");
       $("#siteHost").textContent = new URL(config.base_url).host;
+      applyCategoryAvailability(config.categories);
       if (config.sites?.length) renderSites({sites: config.sites, active_id: config.site_id});
     } catch (_) {}
     await loadSettings();
-    if (state.activeView === "settings") loadCacheStats();
     restartDownloadPolling();
-    if (state.activeView === "downloads") await loadDownloads();
-    else if (state.activeView === "catalog") { await loadCatalog(); await loadDownloads(); }
+    if (state.activeView === "settings") loadCacheStats();
+    else if (state.activeView === "catalog") await loadCatalog();
+    // 无论停在哪个页面都拉一次下载队列：左下角卡片要能显示正在跑的任务
+    await loadDownloads();
   })();
 });
 

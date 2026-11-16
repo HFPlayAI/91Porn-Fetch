@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "91fetch"
-version = "1.1.9"
+version = "1.1.15"
 description = "Web UI for browsing and batch-downloading 91porn viewkey videos"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -37,6 +37,8 @@ dependencies = [
   "yt-dlp>=2025.1.15",
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.34.0",
+  # 自带 ffmpeg：HLS 站点（91pinse 系）的 MPEG-TS 分片要转成 MP4
+  "imageio-ffmpeg>=0.5.1",
 ]
 
 [project.optional-dependencies]

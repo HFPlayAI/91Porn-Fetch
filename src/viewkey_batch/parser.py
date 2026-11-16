@@ -77,28 +77,133 @@ def strip_site_suffix(title: str, config: SiteConfig) -> str:
     return stripped or title
 
 
-def viewkey_from_url(url: str) -> str:
-    return parse_qs(urlparse(url).query).get("viewkey", [""])[0]
+def viewkey_from_url(url: str, config: SiteConfig | None = None) -> str:
+    """从视频页地址里取出视频 ID。
+
+    91porn 系把它放在查询串（``?viewkey=xxx``），91pinse 系放在路径
+    （``/v/475058``）。先按站点配置取，再退回两种通用写法，
+    这样即使站点配置没写全也不会整页条目全丢。
+    """
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return ""
+    query = parse_qs(parts.query)
+    if config is not None and config.viewkey_param:
+        value = query.get(config.viewkey_param, [""])[0]
+        if value:
+            return value
+    if config is not None and config.viewkey_path_regex:
+        match = re.search(config.viewkey_path_regex, parts.path)
+        if match and match.lastindex:
+            return match.group(1)
+    value = query.get("viewkey", [""])[0]
+    if value:
+        return value
+    # 路径型地址兜底：/v/475058、/v/475058/、/video/475058
+    match = re.search(r"/(?:v|video|view)/(\d+)/?$", parts.path)
+    return match.group(1) if match else ""
+
+
+def _node_text(node) -> str:
+    return node.get_text(" ", strip=True) if node else ""
+
+
+# 「7小时前」「3天前」这类相对时间也在卡片 meta 里，别当成播放量
+_TIME_LABEL_RE = re.compile(r"(前|小时|分钟|秒|天|周|月|年)\s*$")
+
+
+def _first_number(text: str) -> str:
+    """卡片上的播放量是裸数字（``<span>2086</span>``），取第一段数字即可。"""
+    match = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*([万wWkK])?", text or "")
+    if not match:
+        return ""
+    value = match.group(1).replace(",", "")
+    unit = match.group(2) or ""
+    if not unit:
+        return value
+    try:
+        scale = 10000 if unit == "万" else 1000
+        return str(int(float(value) * scale))
+    except ValueError:
+        return value
+
+
+def _card_views(container, selector: str) -> str:
+    """播放量：跳过「7小时前」这种相对时间，取第一个真正的数字。"""
+    if container is None or not selector:
+        return ""
+    try:
+        nodes = container.select(selector)
+    except Exception:
+        return ""
+    for node in nodes:
+        text = node.get_text(" ", strip=True)
+        if not text or _TIME_LABEL_RE.search(text):
+            continue
+        number = _first_number(text)
+        if number:
+            return number
+    return ""
+
+
+def _select(node, selector: str):
+    """选择器写错时不要让整页采集失败。"""
+    if node is None or not selector:
+        return None
+    try:
+        return node.select_one(selector)
+    except Exception:  # soupsieve 对非法选择器抛的异常类型不统一
+        return None
+
+
+def _card_anchors(soup: BeautifulSoup, config: SiteConfig) -> tuple[list, dict[int, object]]:
+    """返回「所有视频链接」和「链接 → 所属卡片」的映射。
+
+    classic 的卡片是 ``div.well``，同一个卡片里有详情链接和封面链接；
+    pinse 的卡片是 ``article.video-card``，标题链接和封面链接分开。
+    先按卡片把链接归类，卡片外的链接退回用父节点当容器。
+    """
+    try:
+        anchors = soup.select(config.video_link_selector)
+    except Exception:
+        return [], {}
+    card_of: dict[int, object] = {}
+    if config.card_selector:
+        try:
+            cards = soup.select(config.card_selector)
+        except Exception:
+            cards = []
+        for card in cards:
+            try:
+                inner = card.select(config.video_link_selector)
+            except Exception:
+                continue
+            for anchor in inner:
+                card_of[id(anchor)] = card
+    return anchors, card_of
 
 
 def parse_listing(html: str, page_url: str, config: SiteConfig) -> list[VideoItem]:
     soup = BeautifulSoup(html, "html.parser")
+    anchors, card_of = _card_anchors(soup, config)
     candidates: list[VideoItem] = []
-    for anchor in soup.select(config.video_link_selector):
+    for anchor in anchors:
         href = anchor.get("href")
         if not href:
             continue
         url = urljoin(page_url, href)
-        key = viewkey_from_url(url)
+        key = viewkey_from_url(url, config)
         if not key:
             continue
-        container = anchor.find_parent(class_="well") or anchor.parent
-        title_node = anchor.select_one(".video-title")
-        image = anchor.select_one("img[src]")
-        duration_node = anchor.select_one(".duration")
+        container = card_of.get(id(anchor)) or anchor.parent
+        title_node = _select(container, config.card_title_selector) or _select(anchor, config.card_title_selector)
+        image = _select(anchor, config.card_image_selector) or _select(container, config.card_image_selector)
+        duration_node = _select(container, config.card_duration_selector)
+        author_node = _select(container, config.card_author_selector)
         title = (
             anchor.get("title")
-            or (title_node.get_text(" ", strip=True) if title_node else "")
+            or _node_text(title_node)
             or (image.get("alt", "") if image else "")
             or anchor.get_text(" ", strip=True)
         )
@@ -108,10 +213,10 @@ def parse_listing(html: str, page_url: str, config: SiteConfig) -> list[VideoIte
                 page_url=url,
                 viewkey=key,
                 title=title,
-                author=fields.get("author", ""),
+                author=_node_text(author_node) or fields.get("author", ""),
                 thumbnail_url=urljoin(page_url, image.get("src")) if image and image.get("src") else "",
-                duration=duration_node.get_text(strip=True) if duration_node else fields.get("duration", ""),
-                views=fields.get("views", ""),
+                duration=_node_text(duration_node) or fields.get("duration", ""),
+                views=_card_views(container, config.card_views_selector) or fields.get("views", ""),
             )
         )
     all_tokens = {
@@ -174,6 +279,11 @@ def parse_video_page(html: str, page_url: str, item: VideoItem, config: SiteConf
             if author:
                 item.author = re.split(r"\s*[(（]", author)[0].strip()
             break
+    # 走播放接口的站点（91pinse 系）页面里只有 hls.js 的加载逻辑，
+    # 真实地址在 /api/videos/<id>/playback，这里再去正则抠容易抠到广告位里的
+    # 无关 mp4，所以直接跳过，交给 crawler 调接口。
+    if config.stream_mode == "api" and config.playback_url:
+        return item
     # The first plain <source> is shared placeholder media. The per-video
     # signed URL is percent-encoded inside strencode2(...).
     for encoded in ENCODED_SOURCE_PATTERN.findall(html):

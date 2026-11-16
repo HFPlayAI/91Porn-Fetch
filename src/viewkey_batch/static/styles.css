@@ -131,6 +131,11 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .job-panel span { color: var(--muted); font-size: 11px; line-height: 1.4; }
 .progress-track { grid-column: 1 / -1; height: 3px; overflow: hidden; background: var(--track); margin-top: 4px; }
 .progress-track span { height: 100%; width: 0; background: var(--accent); transition: width .25s; }
+.job-actions { grid-column: 1 / -1; display: flex; gap: 6px; }
+.job-actions button { flex: 1; min-height: 26px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 0 6px; border: 1px solid var(--control-line); border-radius: 4px; background: var(--surface); color: var(--ink); font-size: 11px; cursor: pointer; }
+.job-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.job-actions button:disabled { opacity: .45; cursor: default; }
+.job-actions svg { width: 13px; height: 13px; }
 
 .content { min-width: 0; padding: 28px clamp(18px, 3vw, 42px) 50px; }
 .content-header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 20px; }
@@ -194,8 +199,8 @@ h1 { margin: 0; font-size: 24px; line-height: 1.25; }
 .metadata span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .metadata .author { max-width: 46%; }
 .metadata .key { margin-left: auto; font-family: ui-monospace, Consolas, monospace; }
-.download-summary { min-height: 72px; display: flex; align-items: center; gap: 0; background: var(--surface); border: 1px solid var(--line); padding: 10px 14px; margin-bottom: 14px; }
-.download-summary > div { min-width: 94px; padding: 0 18px; border-right: 1px solid var(--line); }
+.download-summary { min-height: 72px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 0; background: var(--surface); border: 1px solid var(--line); padding: 10px 14px; margin-bottom: 14px; }
+.download-summary > div { min-width: 84px; padding: 0 14px; border-right: 1px solid var(--line); }
 .download-summary > div:first-child { padding-left: 0; }
 .download-summary span, .download-summary strong { display: block; }
 .download-summary span { color: var(--muted); font-size: 10px; margin-bottom: 5px; }
@@ -336,13 +341,18 @@ h1 { margin: 0; font-size: 24px; line-height: 1.25; }
 .site-item-body strong { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site-item-body span { color: var(--muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .site-badge { flex: 0 0 auto; height: 20px; padding: 0 7px; display: inline-flex; align-items: center; border-radius: 3px; background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; }
+.site-badge.profile { background: var(--tab-bg); color: var(--muted); font-weight: 600; }
 .site-item .icon-button { width: 30px; height: 30px; flex: 0 0 auto; border-color: transparent; background: transparent; color: var(--muted); }
 .site-item .icon-button:hover { color: var(--danger); background: var(--surface); }
 .site-item .icon-button svg { width: 15px; }
 .site-empty { padding: 14px; border: 1px dashed var(--line); border-radius: 5px; color: var(--muted); font-size: 12px; text-align: center; }
-.site-add-row { display: grid; grid-template-columns: 1fr 1.4fr auto; gap: 12px; align-items: end; max-width: 720px; }
+.site-add-row { display: grid; grid-template-columns: 1fr 1.4fr 0.85fr auto; gap: 12px; align-items: end; max-width: 860px; }
 .site-add-button { height: 38px; white-space: nowrap; }
-.site-note { max-width: 720px; }
+.site-note { max-width: 860px; }
+.site-note code { padding: 1px 4px; border-radius: 3px; background: var(--tab-bg); font-family: ui-monospace, Consolas, monospace; font-size: 10px; }
+
+/* 当前站点没有的栏目直接置灰，点进去只会抓到一页空列表 */
+.category-item.disabled { opacity: .4; cursor: not-allowed; }
 
 /* 网络代理 */
 .proxy-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }

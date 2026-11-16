@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
-from time import time_ns
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from time import time, time_ns
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 import logging
 
 import httpx
@@ -80,7 +80,47 @@ class Crawler:
                     log.info("高清页未返回视频地址（高清画质需要 VIP 登录），回退普通页 %s", item.page_url)
         response = self.client.get(item.page_url)
         response.raise_for_status()
-        return parse_video_page(response.text, str(response.url), item, self.config)
+        item = parse_video_page(response.text, str(response.url), item, self.config)
+        if not item.stream_url:
+            item = self.resolve_stream(item)
+        return item
+
+    def resolve_stream(self, item: VideoItem) -> VideoItem:
+        """走站点的 JSON 播放接口取地址（91pinse 系）。
+
+        详情页里没有媒体地址，浏览器用的是 ``POST /api/videos/<id>/playback``，
+        返回 ``{"url": "...m3u8", "fallback_url": ""}``。接口只认同源 Referer 和
+        ``X-Requested-With``，所以必须先抓过详情页再调，顺序不能反。
+        """
+        config = self.config
+        if config.stream_mode != "api" or not config.playback_url:
+            return item
+        target = urljoin(config.base_url, config.playback_url.format(viewkey=quote(item.viewkey, safe="")))
+        headers = {"Referer": item.page_url, "Origin": config.base_url}
+        headers.update(config.playback_headers or {})
+        if config.playback_method.upper() == "GET":
+            response = self.client.get(target, headers=headers)
+        else:
+            response = self.client.post(target, headers=headers)
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("播放接口返回的不是 JSON，站点规则可能已变更") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("播放接口返回结构异常，站点规则可能已变更")
+        for key in config.playback_url_keys:
+            value = str(payload.get(key) or "").strip()
+            if value.startswith("http"):
+                item.stream_url = value
+                if config.stream_ttl:
+                    item.stream_expires = time() + config.stream_ttl
+                return item
+        message = str(payload.get("detail") or payload.get("message") or "").strip()
+        raise RuntimeError(
+            "播放接口没有返回可用的视频地址"
+            + (f"（{message[:60]}）" if message else "，可能是登录/VIP 限制或站点规则已变更")
+        )
 
 
 def append_manifest(path: Path, item: VideoItem) -> None:

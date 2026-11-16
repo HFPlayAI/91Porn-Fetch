@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urlsplit
@@ -15,6 +15,7 @@ import json
 import re
 
 from .models import SiteConfig
+from .profiles import DEFAULT_PROFILE, detect_profile, normalize_profile, profile_label, rules_for
 
 PROXY_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4", "socks4a"}
 SOCKS_SCHEMES = {"socks5", "socks5h", "socks4", "socks4a"}
@@ -119,21 +120,35 @@ def site_name_from_url(base_url: str) -> str:
 
 @dataclass
 class SiteEntry:
-    """站点列表中的一项：``id`` 由域名派生，用于稳定引用。"""
+    """站点列表中的一项：``id`` 由域名派生，用于稳定引用。
+
+    除了域名，每个站点还自带一整套解析规则（``rules``）。以前切站点只改
+    ``site.json`` 的 ``base_url``，规则共用一份，碰上页面结构完全不同的镜像站
+    就会一条都抓不到；现在切站点等于把该站点的规则整份写进 ``site.json``。
+    """
 
     id: str
     name: str
     base_url: str
+    profile: str = DEFAULT_PROFILE
+    rules: dict = field(default_factory=dict)
 
     def payload(self) -> dict:
-        return {"id": self.id, "name": self.name, "base_url": self.base_url}
+        return {
+            "id": self.id,
+            "name": self.name,
+            "base_url": self.base_url,
+            "profile": self.profile,
+            "profile_label": profile_label(self.profile),
+        }
 
 
 class SiteBook:
-    """维护「站点列表 + 当前生效站点」，并同步写回 site.json 的 base_url。
+    """维护「站点列表 + 当前生效站点」，并同步写回 site.json。
 
-    site.json 依旧是唯一的事实来源（CLI、采集器、下载器都读它），
-    切站点时改写它的 base_url，其余解析规则保持不变，避免两套配置打架。
+    site.json 依旧是唯一的事实来源（CLI、采集器、下载器都读它）。
+    切站点时不仅改写 base_url，还把这套站点自己的解析规则一并写进去，
+    这样不同结构的镜像站可以共存。
     """
 
     def __init__(self, path: Path, config_path: Path) -> None:
@@ -150,8 +165,20 @@ class SiteBook:
         except (OSError, ValueError, KeyError):
             return ""
 
+    def _current_rules(self) -> dict:
+        """读取 site.json 里除 base_url 之外的全部规则。"""
+        try:
+            raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        raw.pop("base_url", None)
+        return raw
+
     def _load(self) -> None:
         current = self._current_base_url()
+        current_rules = self._current_rules() if current else {}
         raw: dict = {}
         if self.path.exists():
             try:
@@ -169,11 +196,15 @@ class SiteBook:
             if identifier in seen:
                 identifier = site_id_from_url(base_url, seen)
             seen.add(identifier)
+            profile = normalize_profile(str(item.get("profile") or "") or detect_profile(base_url))
+            rules = item.get("rules")
             entries.append(
                 SiteEntry(
                     id=identifier,
                     name=str(item.get("name") or site_name_from_url(base_url))[:60],
                     base_url=base_url,
+                    profile=profile,
+                    rules=rules if isinstance(rules, dict) else {},
                 )
             )
         # site.json 里的地址如果不在列表里（首次运行 / 手工改过），作为默认项补进去
@@ -189,8 +220,22 @@ class SiteBook:
                         id=site_id_from_url(normalized, seen),
                         name=site_name_from_url(normalized),
                         base_url=normalized,
+                        profile=normalize_profile(str(current_rules.get("profile") or "") or detect_profile(normalized)),
+                        rules={},
                     ),
                 )
+        # 规则补齐：老版本 sites.json 没有 rules 字段。
+        # 当前生效站点直接采用 site.json 里的规则（手工调过的选择器不会被覆盖），
+        # 其余站点用自己模板的预设。
+        for entry in entries:
+            if current and host_of(entry.base_url) == host_of(current) and current_rules:
+                entry.rules = dict(current_rules)
+                entry.profile = normalize_profile(str(current_rules.get("profile") or "") or entry.profile)
+            elif not entry.rules:
+                entry.rules = rules_for(entry.profile)
+            # 规则里始终写明模板名：切到该站点时写回的 site.json 才自带 profile，
+            # 不会因为缺这个键而回落到默认值
+            entry.rules["profile"] = entry.profile
         self.entries = entries
         wanted = str(raw.get("active_id", "")) if isinstance(raw, dict) else ""
         match = next((entry for entry in entries if entry.id == wanted), None)
@@ -205,7 +250,16 @@ class SiteBook:
             content = json.dumps(
                 {
                     "active_id": self.active_id,
-                    "sites": [entry.payload() for entry in self.entries],
+                    "sites": [
+                        {
+                            "id": entry.id,
+                            "name": entry.name,
+                            "base_url": entry.base_url,
+                            "profile": entry.profile,
+                            "rules": entry.rules,
+                        }
+                        for entry in self.entries
+                    ],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -217,14 +271,18 @@ class SiteBook:
 
     def snapshot(self) -> list[SiteEntry]:
         with self.lock:
-            return [SiteEntry(entry.id, entry.name, entry.base_url) for entry in self.entries]
+            return [
+                SiteEntry(entry.id, entry.name, entry.base_url, entry.profile, dict(entry.rules))
+                for entry in self.entries
+            ]
 
     def active(self) -> SiteEntry | None:
         with self.lock:
             return next((entry for entry in self.entries if entry.id == self.active_id), None)
 
-    def add(self, name: str, base_url: str) -> SiteEntry:
+    def add(self, name: str, base_url: str, profile: str = "") -> SiteEntry:
         normalized = normalize_base_url(base_url)
+        chosen = normalize_profile(profile) if (profile or "").strip() else detect_profile(normalized)
         with self.lock:
             existing = next((entry for entry in self.entries if host_of(entry.base_url) == host_of(normalized)), None)
             if existing is not None:
@@ -234,6 +292,8 @@ class SiteBook:
                 id=site_id_from_url(normalized, taken),
                 name=(name or "").strip()[:60] or site_name_from_url(normalized),
                 base_url=normalized,
+                profile=chosen,
+                rules=rules_for(chosen),
             )
             self.entries.append(entry)
         self.save()
@@ -250,21 +310,36 @@ class SiteBook:
             if self.active_id == site_id:
                 self.active_id = self.entries[0].id
                 switch = self.entries[0].base_url
+                rules = dict(self.entries[0].rules)
             else:
                 switch = ""
+                rules = {}
         self.save()
         if switch:
-            self.apply(switch)
+            self.apply(switch, rules)
         return True
 
-    def apply(self, base_url: str) -> None:
-        """把 site.json 的 base_url 换成新站点，其它解析规则原样保留。"""
+    def apply(self, base_url: str, rules: dict | None = None) -> None:
+        """把 site.json 换成新站点的地址和规则。
+
+        没有传 rules 时只改 base_url（保持老行为）。传了 rules 就以 rules 为准：
+        上一套规则里独有的键（比如 pinse 的 playback_url）必须被清掉，否则切回
+        91porn 后会留下半套 pinse 配置；用户在 site.json 里自己加的旁路键保留。
+        """
         try:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"无法读取站点配置文件 site.json：{exc}") from exc
-        raw["base_url"] = base_url
-        content = json.dumps(raw, ensure_ascii=False, indent=2)
+        known = {item.name for item in fields(SiteConfig)}
+        merged = {
+            key: value
+            for key, value in (raw.items() if isinstance(raw, dict) else [])
+            if key not in known
+        }
+        if rules:
+            merged.update({key: value for key, value in rules.items() if key in known})
+        merged["base_url"] = base_url
+        content = json.dumps(merged, ensure_ascii=False, indent=2)
         temporary = self.config_path.with_suffix(".json.tmp")
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(self.config_path)
@@ -276,8 +351,9 @@ class SiteBook:
                 raise ValueError("站点不存在")
             self.active_id = target.id
             url = target.base_url
+            rules = dict(target.rules)
         self.save()
-        self.apply(url)
+        self.apply(url, rules)
         return target
 
 

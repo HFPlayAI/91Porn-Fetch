@@ -3,15 +3,18 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import Event, Lock, Thread, Timer
-from time import time
+from time import sleep, time
 from typing import Literal
-from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse, urlsplit, urlunparse
 import base64
 import hashlib
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import socket
+import threading
 import uuid
 import webbrowser
 
@@ -26,10 +29,10 @@ import uvicorn
 
 from .cache import ListingCache, PrefetchQueue, cache_key, ttl_for, VIDEO_TTL
 from .crawler import Crawler, fresh_listing_url, listing_page_url
-from .downloader import BatchDownloader, validate_media_file
+from .downloader import BatchDownloader, StalledError, is_drop_error, is_stalled_error, validate_media_file
 from .http import build_client, load_cookies, make_httpx_client
 from .models import SiteConfig, VideoItem
-from .parser import parse_listing, parse_video_page
+from .parser import parse_listing, parse_video_page, viewkey_from_url
 from .sites import (
     SiteBook,
     normalize_proxy,
@@ -49,6 +52,11 @@ VIDEO_DIR = DATA_DIR / "videos"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 COOKIES_PATH = DATA_DIR / "cookies.txt"
 THUMB_DIR = DATA_DIR / "thumbs"
+
+log = logging.getLogger("viewkey.web")
+
+# 状态文件落盘锁：多个下载线程收尾时都会写 state.json，必须串行
+_atomic_write_lock = Lock()
 
 
 class AppSettings(BaseModel):
@@ -109,6 +117,88 @@ def site_book() -> SiteBook:
 def app_proxy() -> str:
     """当前生效的代理地址；空串表示走系统/环境变量代理。"""
     return settings_store.snapshot().proxy.strip()
+
+
+# 停滞看门狗：窗口内的平均速率低于阈值就认定连接被 CDN 掐死，中断重连。
+# 站点把单连接压到 100 B/s 时，yt-dlp 的 socket_timeout 永远不触发，
+# 任务会一直挂在「正在下载」却下不动。
+STALL_WINDOW_SECONDS = 40
+STALL_MIN_BPS = 8 * 1024
+
+# 直链签名（st=/e= 或 secure=...,<时间戳>）有效期约 3 小时，留 5 分钟余量复用
+STREAM_URL_MARGIN_SECONDS = 300
+
+
+def stream_url_fresh(url: str) -> bool:
+    """判断直链签名是否还没过期，未过期就不必重新解析视频页。
+
+    站点给的临时直链带过期时间戳，排队的几十个任务如果每条都重新解析，
+    一串密集请求很容易再次触发 Cloudflare 的 IP 封禁（error 1106）。
+    """
+    if not url or "://" not in url:
+        return False
+    try:
+        query = parse_qs(urlparse(url).query)
+    except ValueError:
+        return False
+    stamp = ""
+    if query.get("e"):
+        stamp = query["e"][0]
+    elif query.get("secure"):
+        # cdn77 形如 secure=<token>,<expire>
+        stamp = query["secure"][0].rsplit(",", 1)[-1]
+    if not stamp.isdigit():
+        return False
+    return int(stamp) - time() > STREAM_URL_MARGIN_SECONDS
+
+
+# 连接层失败（RST / TLS 握手超时 / 读超时）说明这条签名直链已经作废了：可能是出口 IP
+# 被 CDN 拒了，也可能是签名被判无效。只要签名里的 e= 还没到期，item_stream_fresh()
+# 就会一直说「新鲜」，于是每一轮重试都在打同一个死链接——用户看到的就是
+# 「重新下载无数次，永远卡在 0%」。这里按「主机+路径」记住失败过的直链，
+# 一旦连接层失败就把它清掉，下一次必须重新去视频页换一条新链接。
+_failed_streams: dict[str, tuple[str, int]] = {}
+
+
+def stream_host_path(url: str) -> str:
+    """直链的「主机+路径」，忽略每次都变的签名参数。"""
+    parts = urlsplit(url or "")
+    host = (parts.netloc or "").lower()
+    return f"{host}{parts.path}" if host else ""
+
+
+def mark_stream_dead(key: str, item: VideoItem) -> int:
+    """作废这条任务的直链，返回同一个主机连续失败的次数。"""
+    host_path = stream_host_path(item.stream_url)
+    times = 0
+    if host_path:
+        previous, times = _failed_streams.get(key, ("", 0))
+        times = times + 1 if previous == host_path else 1
+        _failed_streams[key] = (host_path, times)
+    with store.lock:
+        stored = store.videos.get(key)
+        if stored is not None:
+            stored.stream_url = ""
+            stored.stream_expires = 0.0
+    store.save()
+    return times
+
+
+def item_stream_fresh(item: VideoItem) -> bool:
+    """这条任务手里的直链还能不能直接用。
+
+    页面内联的直链可以从签名里算到期时间；播放接口给的 HLS 地址没有签名，
+    解析时按站点的 stream_ttl 记了 ``stream_expires``，两者都认。
+    """
+    if not item.stream_url:
+        return False
+    failed = _failed_streams.get(item.identity)
+    if failed and failed[0] and failed[0] == stream_host_path(item.stream_url):
+        # 这条链接在连接层已经失败过，别再拿它去撞墙
+        return False
+    if item.stream_expires and item.stream_expires - time() > STREAM_URL_MARGIN_SECONDS:
+        return True
+    return stream_url_fresh(item.stream_url)
 
 
 def site_hosts() -> set[str]:
@@ -172,6 +262,9 @@ class Job:
     started_at: float = field(default_factory=time)
     viewkeys: list[str] = field(default_factory=list)
     cancelled: bool = False
+    skipped: int = 0
+    # 暂停时也走 cancelled 中断在跑的 yt-dlp，但状态记成 paused 而不是失败
+    paused: bool = False
 
 
 class CrawlRequest(BaseModel):
@@ -274,7 +367,9 @@ class Store:
                 self.dismissed_downloads = set(raw.get("dismissed_downloads", []))
                 for status in self.download_status.values():
                     if status.get("state") in {"queued", "downloading"}:
-                        status.update(state="failed", error="上次运行被中断，点击重试可继续下载")
+                        # 上次运行时被强杀的，记成「已暂停」而不是失败：
+                        # 它会出现在已暂停里，用户手动点「继续下载」就能从 .part 续传
+                        status.update(state="paused", error="", speed="", speed_bps=0.0, speed_at=0.0)
             except (json.JSONDecodeError, OSError):
                 self.download_status = {}
                 self.dismissed_downloads = set()
@@ -299,9 +394,12 @@ class Store:
     @staticmethod
     def _atomic_write(path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(content, encoding="utf-8")
-        temporary.replace(path)
+        # 多个下载线程会同时收尾并写状态文件：临时文件名按线程区分并串行化落盘，
+        # 否则两个线程会抢同一个 .tmp，Windows 上直接 PermissionError（WinError 32）
+        temporary = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with _atomic_write_lock:
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(path)
 
     def add(self, item: VideoItem) -> None:
         with self.lock:
@@ -388,75 +486,231 @@ def downloaded_keys() -> set[str]:
     return keys
 
 
-download_queue_wake = Event()
+# ---- 全局下载队列 ----
+# 所有下载入口（下载所选 / 下载全部未完成 / 继续下载 / 单个重试）都只往同一个队列里塞任务，
+# 由 DownloadScheduler 统一按设置里的「并行下载数」起线程：真正同时在下的视频数永远不超过
+# 这个值，一个下完才补下一个。旧实现是「一次点击 = 一个批次任务」，批次之间各跑各的，
+# 多点几下就会同时开出十几路连接，正是站点限速和 403 error 1106 的触发源。
+
+LISTING_SNAPSHOT_TTL_SECONDS = 600.0
+
+
+def _set_status(key: str, *, state: str, error: str = "", **fields) -> None:
+    """更新单条下载状态；条目已被用户删除时什么都不做。"""
+    with store.lock:
+        current = store.download_status.get(key)
+        if current is None:
+            return
+        current = dict(current)
+        current.update(state=state, error=error)
+        current.update(fields)
+        store.download_status[key] = current
+
+
+class DownloadScheduler:
+    """全局下载队列：同一个队列、同一个并发上限，完成一个才补下一个。"""
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.queue: list[str] = []
+        self.running: dict[str, Thread] = {}
+        # 停滞任务在这里等冷却（key -> 到点时间），到点后回到队列尾
+        self.deferred: dict[str, float] = {}
+        # 熔断冷却截止时间：到点前不启动新任务
+        self.cooldown_until = 0.0
+        self.cancelled: set[str] = set()
+        self.paused = False
+        self.wake = Event()
+        self._thread: Thread | None = None
+        self._started = False
+
+    # ---- 对外接口 ----
+
+    @staticmethod
+    def limit() -> int:
+        """并发上限始终取设置中心的「并行下载数」，改完设置下一个任务就生效。"""
+        return max(1, min(8, int(settings_store.snapshot().workers)))
+
+    def ensure_started(self) -> None:
+        with self.lock:
+            if self._started:
+                return
+            self._started = True
+            self._thread = Thread(target=self._loop, daemon=True, name="viewkey-download-scheduler")
+            self._thread.start()
+
+    def enqueue(self, keys: list[str]) -> int:
+        self.ensure_started()
+        added = 0
+        with self.lock:
+            self.paused = False
+            known = set(self.queue) | set(self.running) | set(self.deferred)
+            for key in keys:
+                if key in known:
+                    continue
+                self.queue.append(key)
+                known.add(key)
+                added += 1
+        self.wake.set()
+        return added
+
+    def pause(self) -> None:
+        with self.lock:
+            self.paused = True
+            self.cancelled.update(self.running)
+            self.queue.clear()
+            self.deferred.clear()
+        self.wake.set()
+
+    def cancel(self, keys) -> None:
+        removed = set(keys)
+        with self.lock:
+            self.queue[:] = [key for key in self.queue if key not in removed]
+            for key in removed:
+                self.deferred.pop(key, None)
+            self.cancelled.update(removed & set(self.running))
+        self.wake.set()
+
+    def cool_down(self, seconds: float) -> None:
+        """整体冷却：到点前 _fill 不启动任何新任务。"""
+        with self.lock:
+            self.cooldown_until = max(self.cooldown_until, time() + seconds)
+        self.wake.set()
+
+    def requeue(self, key: str, delay: float) -> None:
+        """让任务先冷却一会儿再回到队列尾：把并发位腾给别人先下。"""
+        with self.lock:
+            self.deferred[key] = time() + max(delay, 0.0)
+        self.wake.set()
+
+    def should_stop(self, key: str) -> bool:
+        return self.paused or key in self.cancelled
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            return {
+                "queued": list(self.queue),
+                "running": list(self.running),
+                "waiting": sorted(self.deferred),
+            }
+
+    # ---- 调度循环 ----
+
+    def _loop(self) -> None:
+        while True:
+            try:
+                self._fill()
+            except Exception:  # 调度线程不能死，否则整个下载队列停摆
+                log.exception("下载调度异常")
+            self.wake.wait(0.5)
+            self.wake.clear()
+
+    def _fill(self) -> None:
+        with self.lock:
+            if self.paused:
+                return
+            limit = self.limit()
+            if time() < self.cooldown_until:
+                return
+            # 冷却到点的任务回到队列尾
+            now = time()
+            for key, due in list(self.deferred.items()):
+                if due > now:
+                    continue
+                self.deferred.pop(key, None)
+                if key not in self.queue and key not in self.running:
+                    self.queue.append(key)
+            # 队列里可能混进了被删除、已下完或被暂停的条目，先清掉再补位
+            self.queue[:] = [
+                key for key in self.queue
+                if key in store.videos and store.download_status.get(key, {}).get("state") == "queued"
+            ]
+            while self.queue and len(self.running) < limit:
+                key = self.queue.pop(0)
+                thread = Thread(target=self._run, args=(key,), daemon=True, name=f"viewkey-download-{key}")
+                self.running[key] = thread
+                thread.start()
+
+    def _run(self, key: str) -> None:
+        try:
+            with store.lock:
+                item = store.videos.get(key)
+            if item is not None:
+                download_one(key, item)
+        except Exception as exc:
+            log.exception("下载任务异常 %s", key)
+            _set_status(key, state="failed", error=str(exc))
+            # 异常路径同样要落盘，否则界面刷新后这条任务又变回「等待中」
+            store.save_state()
+        finally:
+            with self.lock:
+                self.running.pop(key, None)
+                self.cancelled.discard(key)
+            self.wake.set()
+
+
+scheduler = DownloadScheduler()
 
 
 def queue_download(viewkeys: list[str], workers: int, fragments: int, kind: str = "download") -> Job:
+    """把任务放进全局队列；workers/fragments 只为兼容旧调用，并发一律以设置中心为准。"""
+    requested = list(dict.fromkeys(viewkeys))
     with store.lock:
         active_keys = {
             key for key, status in store.download_status.items()
             if status.get("state") in {"queued", "downloading"}
         }
-        valid = list(dict.fromkeys(key for key in viewkeys if key in store.videos and key not in active_keys))
+        # 已经在队列或正在下载的条目直接跳过，不让一个重复项把整批请求顶回去：
+        # 之前只要有一条在跑就整批 409，用户看到的只是「服务器返回异常（HTTP 409）」
+        valid = [key for key in requested if key in store.videos and key not in active_keys]
+        skipped = len(requested) - len(valid)
         if not valid:
-            raise HTTPException(409, "所选视频已在下载队列中")
+            if not any(key in store.videos for key in requested):
+                raise HTTPException(409, "这些视频不在当前采集结果里，请重新采集后再下载")
+            raise HTTPException(
+                409,
+                f"所选 {len(requested)} 个任务已在下载队列中，等它们下完再试",
+            )
         for key in valid:
             store.dismissed_downloads.discard(key)
-            store.download_status[key] = {"state": "queued", "percent": 0, "error": ""}
+            for kind in ("stall", "drop"):
+                _yield_counts.pop((key, kind), None)
+            # 手动重试要重新给机会：用户可能刚换了代理节点，别拿上一轮的失败次数卡死
+            _failed_streams.pop(key, None)
+            current = store.download_status.get(key) or {}
+            store.download_status[key] = {
+                "state": "queued",
+                # 续传时保留原进度，进度条不会莫名其妙归零
+                "percent": current.get("percent", 0) if current.get("state") == "paused" else 0,
+                "error": "",
+            }
     store.save_state()
-    request = DownloadRequest(viewkeys=valid, workers=workers, fragments=fragments)
     job = new_job(kind)
     job.total = len(valid)
+    job.skipped = skipped
     job.viewkeys = valid
-    Thread(target=queued_download_worker, args=(job, request), daemon=True).start()
+    job.message = f"排队等待 0/{len(valid)}"
+    scheduler.enqueue(valid)
     return job
 
 
-def queued_download_worker(job: Job, request: DownloadRequest) -> None:
-    while not job.cancelled:
-        with store.lock:
-            running = any(
-                other.id != job.id and other.kind == "download"
-                and not other.cancelled and other.status == "running"
-                for other in store.jobs.values()
-            )
-            queued = sorted(
-                (other for other in store.jobs.values()
-                 if other.kind == "download" and not other.cancelled and other.status == "queued"),
-                key=lambda other: (other.started_at, other.id),
-            )
-            if not running and queued and queued[0].id == job.id:
-                break
-        download_queue_wake.wait(.4)
-        download_queue_wake.clear()
-    if job.cancelled:
-        return
-    try:
-        download_worker(job, request)
-    finally:
-        download_queue_wake.set()
+def reconcile_download_state() -> None:
+    """启动时只做状态收尾，绝不自动开始下载——下载必须由用户手动点。
 
-
-def resume_interrupted_downloads() -> None:
+    旧版本会在启动时把「上次被中断」的任务直接重新入队，程序一开就对着站点
+    连开好几路请求，很容易刚启动就被限速。现在只把磁盘上已经完整的文件标成已完成，
+    其余保持「已暂停」，等用户自己点「继续下载」或「下载全部未完成」。
+    """
     existing = downloaded_keys()
+    if not existing:
+        return
     with store.lock:
-        interrupted = [
-            key for key, status in store.download_status.items()
-            if status.get("state") == "failed"
-            and "上次运行被中断" in status.get("error", "")
-            and key in store.videos
-        ]
-        for key in interrupted:
-            if key in existing:
+        for key in existing:
+            status = store.download_status.get(key)
+            if status and status.get("state") != "completed":
                 store.download_status[key] = {"state": "completed", "percent": 100, "error": ""}
-    pending = [key for key in interrupted if key not in existing]
     store.save_state()
-    if pending:
-        current = settings_store.snapshot()
-        try:
-            queue_download(pending, current.workers, current.fragments)
-        except HTTPException:
-            pass
+
 
 
 def new_job(kind: str) -> Job:
@@ -476,6 +730,10 @@ def crawl_worker(job: Job, request: CrawlRequest) -> None:
         elif request.mode == "url":
             start_url = align_to_site(request.url, config)
         else:
+            if request.category not in config.category_urls:
+                raise RuntimeError(
+                    f"当前站点没有「{request.category}」这个栏目，换一个分类或切换回原站点再试"
+                )
             start_url = config.category_urls[request.category]
         start_url = urljoin(config.base_url, start_url)
         source = request.author or request.category or "custom"
@@ -498,145 +756,408 @@ def crawl_worker(job: Job, request: CrawlRequest) -> None:
         job.message = "采集失败"
 
 
-def _mark_cancelled(job: Job, request: DownloadRequest) -> None:
-    """任务被删除后，把还在排队/下载中的条目标记为失败，避免状态卡死。"""
+def check_stall(
+    watch: dict[str, tuple[float, int]], key: str, downloaded: int, now: float
+) -> float | None:
+    """停滞看门狗：返回窗口内平均速率（B/s）表示判定为停滞，否则 None。
+
+    只看 yt-dlp 的 speed 不够准（它自己做了平滑），这里用「窗口内
+    downloaded_bytes 的净增长 / 实际经过时间」，能直接抓到 100 B/s 这种半死连接。
+    """
+    mark = watch.get(key)
+    if mark is None:
+        watch[key] = (now, downloaded)
+        return None
+    elapsed = now - mark[0]
+    if elapsed < STALL_WINDOW_SECONDS:
+        return None
+    rate = (downloaded - mark[1]) / elapsed
+    if rate < STALL_MIN_BPS:
+        watch.pop(key, None)
+        return rate
+    watch[key] = (now, downloaded)
+    return None
+
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def strip_ansi(text: object) -> str:
+    """去掉 ANSI 颜色码。
+
+    yt-dlp 内部的速度字符串是 `\\x1b[0;32m 260.40KiB/s\\x1b[0m`，直接塞进网页
+    会露出 `[0;32m` 这种乱码，所以凡是给前端看的字符串都要先过一遍这里。
+    """
+    return ANSI_ESCAPE.sub("", str(text or "")).strip()
+
+
+def format_speed(bps: float) -> str:
+    """把字节/秒格式化成 1.24 MB/s，代替 yt-dlp 带颜色码的字符串。"""
+    if not bps or bps <= 0:
+        return ""
+    units = ("B/s", "KB/s", "MB/s", "GB/s")
+    value = float(bps)
+    index = 0
+    while value >= 1024 and index < len(units) - 1:
+        value /= 1024
+        index += 1
+    return f"{value:.0f} {units[index]}" if index < 2 else f"{value:.2f} {units[index]}"
+
+
+SITE_BLOCKED_HINT = (
+    "站点临时拒绝访问（HTTP 403 / Cloudflare error 1106）：当前代理节点的出口 IP "
+    "被站点判为异常流量。请等 1–2 分钟后再试，或换一个代理节点"
+)
+STREAM_FAIL_LIMIT = 3
+SITE_COOLDOWN_SECONDS = 60
+# 已完成的任务发现文件不见了时用的提示语。以它为前缀的失败记录会被当成
+# 「用户自己删了文件」，不再在下载列表里显示成失败任务
+MISSING_FILE_MARK = "本地文件不存在"
+
+
+def _resolve_with_cooldown(crawler: Crawler, item: VideoItem, prefer_hd: bool) -> VideoItem:
+    """解析视频页；碰到 403（Cloudflare 按 IP 封禁）先冷却再试一次。
+
+    实测 1106 封禁是临时的：停手 1–2 分钟后再请求就恢复 200。
+    """
+    for attempt in range(2):
+        try:
+            return crawler.resolve(item, prefer_hd=prefer_hd)
+        except httpx.HTTPStatusError as exc:
+            blocked = exc.response.status_code == 403
+            if not blocked or attempt:
+                if blocked:
+                    raise RuntimeError(SITE_BLOCKED_HINT) from exc
+                raise
+            log.info("站点临时限制当前 IP，冷却 %s 秒后重试", SITE_COOLDOWN_SECONDS)
+            sleep(SITE_COOLDOWN_SECONDS)
+    raise RuntimeError(SITE_BLOCKED_HINT)
+
+
+def describe_site_error(exc: Exception) -> str:
+    """把 httpx 的网络异常翻译成用户能照做的提示。"""
+    if isinstance(exc, httpx.ProxyError):
+        return "代理拒绝连接，请检查设置中心里的代理地址与端口是否正确"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "连接站点超时：代理节点可能已失效，请切换节点或重启代理后重试"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "站点响应超时：代理不稳或当前出口 IP 被限流，稍后再试或换节点"
+    if isinstance(exc, httpx.ConnectError):
+        return "无法连接到站点：代理没有启动或节点不可用"
+    return str(exc) or exc.__class__.__name__
+
+
+_listing_snapshots: dict[tuple[str, int], tuple[float, dict[str, VideoItem]]] = {}
+_listing_snapshot_locks: dict[tuple[str, int], Lock] = {}
+_listing_snapshot_guard = Lock()
+
+
+def listing_reference(item: VideoItem, config: SiteConfig) -> tuple[str, int] | None:
+    """任务来自哪个列表页（含页码），用于回源校正详情页地址。"""
+    listing = (
+        item.listing_url
+        or item.listing_urls.get(item.source)
+        or next(iter(item.listing_urls.values()), "")
+        or config.category_urls.get(item.source)
+    )
+    if not listing:
+        return None
+    # 清单里记录的可能是上一个镜像站点的地址，统一切到当前站点
+    listing = align_to_site(listing, config)
+    # 采集时记录的列表页码优先；视频详情页 URL 本身不带 page 参数，
+    # 旧清单回退到从 URL 解析，再不行按第 1 页处理
+    page = item.listing_page
+    if page <= 0:
+        value = parse_qs(urlparse(item.page_url).query).get("page", ["1"])[0]
+        page = int(value) if str(value).isdigit() else 1
+    return (urljoin(config.base_url, listing), page)
+
+
+def listing_snapshot(client: httpx.Client, config: SiteConfig, key: tuple[str, int]) -> dict[str, VideoItem]:
+    """同一列表页只回源一次，几十个任务共用一份快照，不会每下一条就抓一遍列表。"""
+    now = time()
+    with _listing_snapshot_guard:
+        cached = _listing_snapshots.get(key)
+        if cached and now - cached[0] < LISTING_SNAPSHOT_TTL_SECONDS:
+            return cached[1]
+        guard = _listing_snapshot_locks.setdefault(key, Lock())
+    with guard:
+        with _listing_snapshot_guard:
+            cached = _listing_snapshots.get(key)
+            if cached and time() - cached[0] < LISTING_SNAPSHOT_TTL_SECONDS:
+                return cached[1]
+        listing_url, page = key
+        response = client.get(fresh_listing_url(listing_page_url(listing_url, config.page_param, page, config.first_page)))
+        response.raise_for_status()
+        snapshot = {item.identity: item for item in parse_listing(response.text, str(response.url), config)}
+        with _listing_snapshot_guard:
+            _listing_snapshots[key] = (time(), snapshot)
+        return snapshot
+
+
+def refresh_page_url(item: VideoItem, config: SiteConfig, client: httpx.Client) -> VideoItem:
+    """用最新列表页校正详情页地址；列表页取不到就退回旧地址，不因此中断下载。"""
+    key = listing_reference(item, config)
+    if key:
+        try:
+            fresh_link = listing_snapshot(client, config, key).get(item.identity)
+        except (httpx.HTTPError, RuntimeError, ValueError):
+            fresh_link = None
+        if fresh_link:
+            return replace(item, page_url=fresh_link.page_url)
+    return replace(item, page_url=align_to_site(item.page_url, config))
+
+
+# 卡住/连不上时，任务让出并发位回到队尾：先给队列里别的任务机会，自己冷却后再来。
+# 站点 CDN 同一个出口 IP 往往只喂一条快连接，两条并发时被冷落的那条会掉到几十 B/s，
+# 以前它原地重连（15/30 秒退避）等于把并发位和带宽一起浪费掉。
+YIELD_LIMITS = {"stall": 6, "drop": 4}
+YIELD_BASE_SECONDS = {"stall": 20, "drop": 30}
+YIELD_MAX_SECONDS = 180
+_yield_counts: dict[tuple[str, str], int] = {}
+# 连续断线熔断：短时间内多条任务都连不上，说明是出口 IP 被站点掐了，
+# 继续重试只会延长封禁，统一歇一会儿
+BREAKER_WINDOW_SECONDS = 90
+BREAKER_COOLDOWN_SECONDS = 60
+_breaker_events: list[float] = []
+_breaker_lock = Lock()
+
+
+def _yield_task(key: str, error: str, kind: str) -> bool:
+    """把卡住（stall）或连不上（drop）的任务退回队尾，返回是否已让位。"""
+    limit = YIELD_LIMITS[kind]
     with store.lock:
-        for key in request.viewkeys:
-            current = store.download_status.get(key)
-            if current and current.get("state") in {"queued", "downloading"}:
-                store.download_status[key] = {
-                    "state": "failed",
-                    "percent": current.get("percent", 0),
-                    "error": "任务已删除",
-                }
-    store.save_state()
-    job.status = "failed"
-    job.error = "任务已删除"
-
-
-def download_worker(job: Job, request: DownloadRequest) -> None:
-    try:
-        if job.cancelled:
-            return
-        job.status = "running"
-        config = SiteConfig.load(CONFIG_PATH)
-        prefer_hd = settings_store.snapshot().prefer_hd
+        count = _yield_counts.get((key, kind), 0) + 1
+        if count > limit:
+            _yield_counts.pop((key, kind), None)
+            return False
+        _yield_counts[(key, kind)] = count
+        current = store.download_status.get(key)
+        if current is None:
+            return False
+        current = dict(current)
+        current.update(state="queued", error="", speed="", speed_bps=0.0, speed_at=0.0)
+        store.download_status[key] = current
+    delay = min(YIELD_BASE_SECONDS[kind] * count, YIELD_MAX_SECONDS)
+    scheduler.requeue(key, delay)
+    log.info(
+        "%s（%s），让出并发位，%s 秒后回到队列尾（第 %s 次）",
+        "连接被掐断" if kind == "drop" else "任务卡住",
+        error.strip()[:60], delay, count,
+    )
+    if kind == "drop":
+        # 连接层断了就把这条直链作废：下一轮重新去视频页换链接，
+        # 否则签名没过期的死链会被反复复用，重试多少次都是 0%
         with store.lock:
-            items = [store.videos[key] for key in request.viewkeys if key in store.videos]
-        job.total = len(items)
-        job.message = "正在刷新视频地址"
-        resolved: list[VideoItem] = []
+            dead = store.videos.get(key)
+        if dead is not None:
+            mark_stream_dead(key, dead)
+        _note_drop()
+    return True
+
+
+def _note_drop() -> None:
+    """连续两条任务都连不上就整体歇 1 分钟：此时重试只会让封禁更久。"""
+    now = time()
+    with _breaker_lock:
+        _breaker_events[:] = [ts for ts in _breaker_events if now - ts < BREAKER_WINDOW_SECONDS]
+        _breaker_events.append(now)
+        if len(_breaker_events) < 2:
+            return
+        _breaker_events.clear()
+        # 这是整条出口被掐，不是单条任务的锅：清掉断线计数，冷却后大家重新开始
+        for key, kind in [item for item in _yield_counts if item[1] == "drop"]:
+            _yield_counts.pop(key, None)
+    scheduler.cool_down(BREAKER_COOLDOWN_SECONDS)
+    log.warning("连续连接失败，判定出口 IP 被站点限制，暂停 %s 秒再试", BREAKER_COOLDOWN_SECONDS)
+
+
+def download_one(key: str, item: VideoItem) -> None:
+    """下载单个视频：解析直链 → 交给 yt-dlp。由调度器按并发上限逐条调用。"""
+    config = SiteConfig.load(CONFIG_PATH)
+    settings = settings_store.snapshot()
+    if item_stream_fresh(item):
+        # 直链签名还没过期：一个页面请求都不发，任务立刻开始跑字节。
+        # 之前无论直链是否有效都先抓一次列表页，每条任务白等 2~4 秒，
+        # 两个并发位轮流空转，排一批任务时前半分钟几乎没速度。
+        store.add(replace(item, page_url=align_to_site(item.page_url, config)))
+    else:
         with build_client(config, app_cookies(), app_proxy()) as client:
             crawler = Crawler(client, config)
-            refreshed: dict[str, VideoItem] = {}
-            listing_groups: dict[tuple[str, int], list[VideoItem]] = {}
-
-            for item in items:
-                if job.cancelled:
-                    _mark_cancelled(job, request)
-                    return
-                listing = (
-                    item.listing_url
-                    or item.listing_urls.get(item.source)
-                    or next(iter(item.listing_urls.values()), "")
-                    or config.category_urls.get(item.source)
+            item = refresh_page_url(item, config, client)
+            if scheduler.should_stop(key):
+                _set_status(key, state="paused")
+                return
+            try:
+                fresh = _resolve_with_cooldown(crawler, item, settings.prefer_hd)
+            except (httpx.HTTPError, RuntimeError) as exc:
+                # 页面都打不开时不要把一句「timed out」甩给用户：区分代理没通和站点限流
+                raise RuntimeError(describe_site_error(exc)) from exc
+            thumb_match = re.search(r"/thumb/(?:\d+_)?(\d+)\.jpg", fresh.thumbnail_url, re.I)
+            media_match = re.search(r"/mp4\d*/(\d+)\.mp4", fresh.stream_url, re.I)
+            if thumb_match and media_match and thumb_match.group(1) != media_match.group(1):
+                raise RuntimeError(f"{fresh.viewkey} 的列表会话已过期，媒体源与封面不匹配，请重新采集后重试")
+            host_path = stream_host_path(fresh.stream_url)
+            previous, times = _failed_streams.get(key, ("", 0))
+            if host_path and previous == host_path and times >= STREAM_FAIL_LIMIT:
+                # 换了新签名还是同一个 CDN 主机连不上，再重试也只是继续撞墙
+                host = host_path.split("/")[0]
+                raise RuntimeError(
+                    f"CDN 主机 {host} 连续 {times} 次拒绝连接，当前出口 IP 大概率被站点限制；"
+                    "请切换代理节点（或换一个 Clash 节点）后再点「继续下载」"
                 )
-                if not listing:
-                    continue
-                # 清单里记录的可能是上一个镜像站点的地址，统一切到当前站点
-                listing = align_to_site(listing, config)
-                # 采集时记录的列表页码优先；视频详情页 URL 本身不带 page 参数，
-                # 旧清单回退到从 URL 解析，再不行按第 1 页处理
-                page = item.listing_page
-                if page <= 0:
-                    page_value = parse_qs(urlparse(item.page_url).query).get("page", ["1"])[0]
-                    page = int(page_value) if str(page_value).isdigit() else 1
-                key = (urljoin(config.base_url, listing), page)
-                listing_groups.setdefault(key, []).append(item)
+            item = fresh
+            store.add(fresh)
+            store.save()
 
-            for (listing_url, page), grouped_items in listing_groups.items():
-                response = client.get(fresh_listing_url(listing_page_url(listing_url, config.page_param, page, config.first_page)))
-                response.raise_for_status()
-                fresh_items = parse_listing(response.text, str(response.url), config)
-                wanted = {item.identity for item in grouped_items}
-                refreshed.update({item.identity: item for item in fresh_items if item.identity in wanted})
+    if scheduler.should_stop(key):
+        _set_status(key, state="paused")
+        return
 
-            for index, item in enumerate(items, 1):
-                fresh_link = refreshed.get(item.identity)
-                if fresh_link:
-                    # 用副本更新 page_url，避免在锁外修改 store 里的共享对象
-                    item = replace(item, page_url=fresh_link.page_url)
-                else:
-                    item = replace(item, page_url=align_to_site(item.page_url, config))
-                fresh = crawler.resolve(item, prefer_hd=prefer_hd)
-                thumb_match = re.search(r"/thumb/(?:\d+_)?(\d+)\.jpg", fresh.thumbnail_url, re.I)
-                media_match = re.search(r"/mp4\d*/(\d+)\.mp4", fresh.stream_url, re.I)
-                if thumb_match and media_match and thumb_match.group(1) != media_match.group(1):
-                    raise RuntimeError(f"{fresh.viewkey} 的列表会话已过期，媒体源与封面不匹配，请重新采集后重试")
-                resolved.append(fresh)
-                store.add(fresh)
-                job.message = f"解析视频地址 {index}/{len(items)}"
-        store.save()
+    watch: dict[str, tuple[float, int]] = {}
 
-        completed: set[str] = set()
-
-        def on_progress(item: VideoItem, data: dict) -> None:
-            if job.cancelled:
-                raise RuntimeError("任务已删除")
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            downloaded = data.get("downloaded_bytes") or 0
-            percent = round(downloaded * 100 / total, 1) if total else 0
-            state = "completed" if data.get("status") == "finished" else "downloading"
-            with store.lock:
-                store.download_status[item.identity] = {
-                    "state": state,
-                    "percent": percent,
-                    "speed": data.get("_speed_str", ""),
-                }
-            if state == "completed" and item.identity not in completed:
-                completed.add(item.identity)
-                job.current = len(completed)
-                job.message = f"已完成 {job.current}/{job.total}"
-
-        results = BatchDownloader(
-            get_video_dir(),
-            request.workers,
-            request.fragments,
-            cookies=COOKIES_PATH if COOKIES_PATH.exists() else None,
-            folder_mode=settings_store.snapshot().folder_mode,
-            progress_callback=on_progress,
-            proxy=app_proxy(),
-        ).download(resolved)
-        if job.cancelled:
-            _mark_cancelled(job, request)
-            return
-        failures = 0
-        for item, error in results:
-            with store.lock:
-                store.download_status[item.identity] = {
-                    "state": "failed" if error else "completed",
-                    "percent": 100 if not error else 0,
-                    "error": error or "",
-                }
-            failures += bool(error)
-        store.save_state()
-        job.status = "failed" if failures else "completed"
-        job.message = f"下载完成 {len(results) - failures}/{len(results)}"
-        job.error = f"{failures} 个任务失败" if failures else ""
-    except Exception as exc:
+    def on_progress(data: dict) -> None:
+        if scheduler.should_stop(key):
+            # 抛异常打断 yt-dlp，已下载部分留在 .part 里，继续时续传
+            raise RuntimeError("任务已暂停或删除")
+        total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
+        downloaded = data.get("downloaded_bytes") or 0
+        percent = round(downloaded * 100 / total, 1) if total else 0
+        state = "completed" if data.get("status") == "finished" else "downloading"
+        # 停滞看门狗：CDN 把速率压到几十 B/s 时 socket_timeout 不触发，
+        # 连接会永远挂着；这里用「窗口内实际增长量」判断，主动断开重连。
+        if state != "completed":
+            stalled_rate = check_stall(watch, key, downloaded, time())
+            if stalled_rate is not None:
+                raise StalledError(f"连接停滞（{stalled_rate / 1024:.1f} KB/s）")
         with store.lock:
-            for key in request.viewkeys:
-                current = store.download_status.get(key, {})
-                if current.get("state") != "completed":
-                    store.download_status[key] = {
-                        "state": "failed",
-                        "percent": current.get("percent", 0),
-                        "error": str(exc),
-                    }
-        store.save_state()
-        job.status = "failed"
-        job.error = str(exc)
-        job.message = "下载失败"
+            if key not in store.download_status:
+                return
+            speed_bps = float(data.get("speed") or 0)
+            store.download_status[key] = {
+                "state": state,
+                "percent": percent,
+                # 速度自己格式化：yt-dlp 的 _speed_str 带 ANSI 颜色码
+                "speed": format_speed(speed_bps),
+                # 汇总总速度要用数值，_speed_str 是给人看的
+                "speed_bps": speed_bps,
+                "speed_at": time(),
+                # 文件总大小与已下载量：任务还没结束时前端据此显示「已下 / 共」，
+                # 下载完成后以磁盘上的真实文件大小为准
+                "total_bytes": total,
+                "downloaded_bytes": downloaded,
+            }
+
+    def on_retry(attempt: int, budget: int) -> None:
+        # 具体是「停滞」还是「断线」由 downloader 自己记一行，这里不重复写原因
+        log.debug("第 %s/%s 次尝试（%s）", attempt, budget, item.title[:24])
+
+    # 真正开始下载了，状态从「等待下载」切到「正在下载」；yt-dlp 在连不上时
+    # 可能十几秒都不触发进度钩子，不切状态的话界面上会一直显示「等待中」
+    _set_status(key, state="downloading")
+    downloader = BatchDownloader(
+        get_video_dir(),
+        1,
+        settings.fragments,
+        cookies=COOKIES_PATH if COOKIES_PATH.exists() else None,
+        folder_mode=settings.folder_mode,
+        progress_callback=lambda _item, data: on_progress(data),
+        proxy=app_proxy(),
+        retry_callback=lambda _item, attempt, attempts: on_retry(attempt, attempts),
+        # 停滞不在这里硬重试：交给 _yield_stalled_task 让出并发位、排队尾再来
+        stall_retries=0,
+    )
+    _item, error = downloader.download_one(item)
+    stats = getattr(downloader, "last_stats", None) or {}
+    if error:
+        # 停滞 → 让位冷却；连不上（握手超时/一直掉线）→ 同样让位，别占着位子空转
+        if is_stalled_error(error) and _yield_task(key, error, "stall"):
+            return
+        if is_drop_error(error) and _yield_task(key, error, "drop"):
+            return
+    title = item.title[:24]
+    if error:
+        log.info(
+            "任务失败 %s：%s（尝试 %s 次，断线重连 %s 次，用时 %ss）",
+            title, error.strip()[:90], stats.get("attempts", 1), stats.get("drops", 0), stats.get("seconds", 0),
+        )
+    else:
+        for kind in ("stall", "drop"):
+            _yield_counts.pop((key, kind), None)
+        _failed_streams.pop(key, None)
+        log.info(
+            "任务完成 %s（尝试 %s 次，断线重连 %s 次，用时 %ss）",
+            title, stats.get("attempts", 1), stats.get("drops", 0), stats.get("seconds", 0),
+        )
+    finish_download(key, error)
+
+
+def describe_download_error(error: str) -> str:
+    """yt-dlp 的原始报错太技术化，失败行前面补一句能照做的说明。"""
+    if is_drop_error(error):
+        return (
+            "CDN 连接中断（代理节点可能已失效，或当前出口 IP 被站点限制）"
+            f"；原始错误：{error.strip()[:140]}"
+        )
+    return error
+
+
+def finish_download(key: str, error: str) -> None:
+    """收尾：暂停/删除中断的记 paused，失败的记 failed，成功的记 completed。"""
+    with store.lock:
+        current = store.download_status.get(key)
+        if current is None:
+            return  # 任务已被用户删除
+        current = dict(current)
+    if scheduler.should_stop(key) or "任务已暂停或删除" in (error or ""):
+        current.update(state="paused", error="", speed="", speed_bps=0.0, speed_at=0.0)
+    elif error:
+        current.update(state="failed", error=describe_download_error(error), speed="", speed_bps=0.0, speed_at=0.0)
+    else:
+        current.update(state="completed", percent=100, error="", speed="", speed_bps=0.0, speed_at=0.0)
+    with store.lock:
+        store.download_status[key] = current
+    store.save_state()
+
+
+def refresh_job(job: Job) -> Job:
+    """一批点击对应一个 job，进度直接由条目状态推出来，不需要额外的看护线程。"""
+    if job.kind != "download" or not job.viewkeys or job.cancelled:
+        return job
+    with store.lock:
+        # 条目被删掉时状态会消失（missing）：同样算「已结束」，批次不会永远卡在运行中
+        states = [store.download_status.get(key, {}).get("state", "missing") for key in job.viewkeys]
+    total = len(states)
+    finished = sum(state in {"completed", "failed", "missing"} for state in states)
+    failed = sum(state == "failed" for state in states)
+    paused = sum(state == "paused" for state in states)
+    job.total = total
+    job.current = finished
+    if job.paused:
+        job.status = "paused"
+        job.message = f"已暂停 {paused}/{total}"
+        return job
+    if finished + paused >= total:
+        if paused:
+            job.status = "paused"
+            job.message = "已暂停，点击继续下载"
+        elif failed:
+            job.status = "failed"
+            job.error = f"{failed} 个任务失败"
+            job.message = f"完成 {finished - failed}/{total}，{failed} 个失败"
+        else:
+            job.status = "completed"
+            job.error = ""
+            job.message = f"下载完成 {total}/{total}"
+        return job
+    job.error = ""
+    if any(state == "downloading" for state in states):
+        job.status = "running"
+        job.message = f"正在下载 {job.current}/{total}"
+    else:
+        job.status = "queued"
+        job.message = f"排队等待 {job.current}/{total}"
+    return job
 
 
 @app.get("/")
@@ -717,15 +1238,23 @@ def listing_source(config: SiteConfig, kind: str, ident: str) -> str:
     return urljoin(config.base_url, config.category_urls[ident])
 
 
-def extract_viewkey(query: str) -> str:
-    """用户可能直接粘视频地址，或输入 16 位 viewkey。"""
+def extract_viewkey(query: str, config: SiteConfig | None = None) -> str:
+    """用户可能直接粘视频地址，或输入纯 ID。
+
+    两种站点的 ID 形态不同：91porn 是 16 位十六进制，91pinse 是纯数字
+    （``/v/475058``）。粘地址时按当前站点的规则取，纯 ID 两种都认。
+    """
     raw = (query or "").strip()
     if not raw:
         return ""
-    if "viewkey=" in raw:
+    if "://" in raw or raw.startswith("/"):
+        if config is not None:
+            return viewkey_from_url(raw, config)
         return parse_qs(urlparse(raw).query).get("viewkey", [""])[0].strip()
     if VIEWKEY_PATTERN.fullmatch(raw):
         return raw.lower()
+    if config is not None and re.fullmatch(r"\d{1,12}", raw):
+        return raw
     return ""
 
 
@@ -903,7 +1432,7 @@ def search(q: str = "", page: int = 1, refresh: bool = False) -> dict:
     _check_page(page)
     config = SiteConfig.load(CONFIG_PATH)
     if page == 1 and not refresh:
-        viewkey = extract_viewkey(query)
+        viewkey = extract_viewkey(query, config)
         if viewkey:
             hit = probe_video(config, viewkey)
             if hit is not None:
@@ -1000,7 +1529,10 @@ def collect_downloads() -> dict:
         if match and (match.group(1) not in files_by_key or _file_mtime(path) > _file_mtime(files_by_key[match.group(1)])):
             files_by_key[match.group(1)] = path
     entries: list[dict] = []
-    missing_completed: set[str] = set()
+    # 已完成、但磁盘上文件已经不在了：按「用户看完删掉了」处理，从下载管理里收掉。
+    # 之前这种情况被改判成 failed 写回 state.json，结果删一次文件就多一批失败任务。
+    removed: set[str] = set()
+    dir_ready = video_dir.exists()
     with store.lock:
         videos = list(store.videos.values())
         statuses = dict(store.download_status)
@@ -1015,11 +1547,24 @@ def collect_downloads() -> dict:
         if not matched and not status:
             continue
         state = status.get("state", "completed") if status else "completed"
+        prior_error = str((status or {}).get("error") or "")
         media_valid = False
-        validation_error = "本地文件不存在，点击重新下载"
+        validation_error = MISSING_FILE_MARK
         if matched:
             media_valid, validation_error = validate_media_file(matched)
-        if state == "completed" and not media_valid:
+        if matched is None and dir_ready:
+            if state == "completed":
+                removed.add(item.identity)
+                continue
+            # 1.1.15 及更早的版本会把「已完成但文件被删」写成这种失败，一并收掉
+            if state == "failed" and prior_error.startswith(MISSING_FILE_MARK):
+                removed.add(item.identity)
+                continue
+        if matched and media_valid and state == "failed" and prior_error.startswith(MISSING_FILE_MARK):
+            # 文件被恢复（从回收站找回 / 重新拷回来），状态跟着回到已完成
+            state = "completed"
+            status = {**status, "state": "completed", "percent": 100, "error": ""}
+        if state == "completed" and not media_valid and dir_ready:
             state = "failed"
             status = {
                 **(status or {}),
@@ -1027,7 +1572,8 @@ def collect_downloads() -> dict:
                 "percent": 0,
                 "error": f"{validation_error}，点击重新下载",
             }
-            missing_completed.add(item.identity)
+        file_size = _file_size(matched)
+        total_bytes = int((status or {}).get("total_bytes") or 0)
         entries.append(
             {
                 "viewkey": item.identity,
@@ -1035,25 +1581,45 @@ def collect_downloads() -> dict:
                 "thumbnail_url": align_media_url(item.thumbnail_url, config, hosts),
                 "state": state,
                 "percent": status.get("percent", 100 if matched else 0) if status else 100,
-                "speed": status.get("speed", "") if status else "",
+                # 速度统一由后端格式化，避免 yt-dlp 的 ANSI 颜色码漏到页面上
+                "speed": format_speed(float((status or {}).get("speed_bps") or 0)),
+                "speed_bps": float(status.get("speed_bps") or 0) if status else 0.0,
+                "speed_at": float(status.get("speed_at") or 0) if status else 0.0,
                 "error": status.get("error", "") if status else "",
                 "file_name": matched.name if matched else "",
-                "file_size": _file_size(matched),
+                # 文件大小以磁盘上的真实文件为准；任务还没结束时用 yt-dlp 探到的总大小
+                "file_size": file_size or total_bytes,
+                "downloaded_bytes": int(status.get("downloaded_bytes") or 0) if status else 0,
+                # 时长来自采集时的列表数据（如 12:34），给下载列表当参考信息
+                "duration": item.duration,
                 "modified": _file_mtime(matched),
             }
         )
-    if missing_completed:
+    if removed:
         with store.lock:
-            for entry in entries:
-                if entry["viewkey"] in missing_completed:
-                    store.download_status[entry["viewkey"]] = {
-                        "state": entry["state"],
-                        "percent": entry["percent"],
-                        "error": entry["error"],
-                    }
+            for key in removed:
+                store.download_status.pop(key, None)
+        for key in sorted(removed):
+            log.info("已完成的任务文件已不存在，按已删除处理，移出下载列表：%s", key)
         store.save_state()
-    counts = {name: sum(entry["state"] == name for entry in entries) for name in ("queued", "downloading", "completed", "failed")}
-    return {"downloads": entries, "counts": counts, "total_size": sum(entry["file_size"] for entry in entries)}
+    counts = {name: sum(entry["state"] == name for entry in entries) for name in ("queued", "downloading", "completed", "failed", "paused")}
+    # 左下角任务卡片要显示的「当前几个任务在下载 + 总体速度」在这里一次算好，
+    # 前端只需按刷新频率读 /api/downloads，不必自己拼
+    active_entries = [entry for entry in entries if entry["state"] in {"queued", "downloading"}]
+    now = time()
+    live = [
+        entry for entry in active_entries
+        # 超过 20 秒没更新速度说明这条卡住了，别把上一秒的数字一直挂在那儿
+        if entry["state"] == "downloading" and now - (entry["speed_at"] or 0) <= 20
+    ]
+    active = {
+        "count": len(active_entries),
+        "downloading": sum(entry["state"] == "downloading" for entry in active_entries),
+        "queued": sum(entry["state"] == "queued" for entry in active_entries),
+        "speed_bps": round(sum(entry["speed_bps"] for entry in live), 1),
+        "percent": round(sum(entry["percent"] or 0 for entry in active_entries) / len(active_entries), 1) if active_entries else 0,
+    }
+    return {"downloads": entries, "counts": counts, "active": active, "total_size": sum(entry["file_size"] for entry in entries)}
 
 
 @app.get("/api/downloads")
@@ -1063,14 +1629,27 @@ def downloads() -> dict:
 
 @app.get("/api/downloads/unfinished")
 def unfinished_downloads() -> dict:
-    """下载管理里「未完成」的任务清单。
+    """下载管理里「待续传」的任务清单。
 
     只认下载管理自己的列表：已从管理里删除的任务、以及采集到但从没进过下载队列的
-    视频都不会被算进来，避免「下载全部未完成」一次拉回几百条。
+    视频都不会被算进来。已经在排队/下载中的条目单独作为 active 返回，
+    不混进待续传清单——它们本来就在跑，再提交一次只会被后端当成重复项拒掉。
     """
     entries = collect_downloads()["downloads"]
-    viewkeys = [entry["viewkey"] for entry in entries if entry["state"] != "completed"]
-    return {"viewkeys": viewkeys, "count": len(viewkeys)}
+    pending: list[str] = []
+    active: list[str] = []
+    for entry in entries:
+        if entry["state"] == "completed":
+            continue
+        target = active if entry["state"] in {"queued", "downloading"} else pending
+        target.append(entry["viewkey"])
+    return {
+        "viewkeys": pending,
+        "count": len(pending),
+        "active": active,
+        "active_count": len(active),
+        "total_count": len(pending) + len(active),
+    }
 
 
 def _is_media_candidate(path: Path) -> bool:
@@ -1117,13 +1696,56 @@ def start_download(request: DownloadRequest) -> dict:
     return asdict(job)
 
 
+@app.post("/api/downloads/pause")
+def pause_downloads() -> dict:
+    """暂停全部下载：中断在跑的 yt-dlp（.part 保留），排队中的直接记为已暂停。"""
+    # 先停调度器：清空待下载队列并标记在跑的任务中断，避免刚暂停就补位开新的
+    scheduler.pause()
+    paused = 0
+    with store.lock:
+        for job in store.jobs.values():
+            if job.kind == "download" and job.status in {"queued", "running"} and not job.cancelled:
+                job.cancelled = True
+                job.paused = True
+                job.status = "paused"
+                job.message = "已暂停，点击继续下载"
+        for key, status in store.download_status.items():
+            if status.get("state") in {"queued", "downloading"}:
+                store.download_status[key] = {
+                    "state": "paused",
+                    "percent": status.get("percent", 0),
+                    "error": "",
+                    "speed": "",
+                    "speed_bps": 0.0,
+                    "speed_at": 0.0,
+                }
+                paused += 1
+    store.save_state()
+    return {"paused": paused}
+
+
+@app.post("/api/downloads/resume")
+def resume_downloads() -> dict:
+    """继续下载：把已暂停的任务重新入队，yt-dlp 接着 .part 续传而不是重下。"""
+    with store.lock:
+        keys = [
+            key for key, status in store.download_status.items()
+            if status.get("state") == "paused" and key in store.videos
+        ]
+    if not keys:
+        return {"resumed": 0, "job": None}
+    current = settings_store.snapshot()
+    job = queue_download(keys, current.workers, current.fragments)
+    return {"resumed": job.total, "job": asdict(job)}
+
+
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
     with store.lock:
         job = store.jobs.get(job_id)
     if not job:
         raise HTTPException(404, "任务不存在")
-    return asdict(job)
+    return asdict(refresh_job(job))
 
 
 @app.post("/api/catalog/remove")
@@ -1133,24 +1755,35 @@ def remove_items(request: RemoveRequest) -> dict:
             store.videos.pop(key, None)
             store.download_status.pop(key, None)
             store.dismissed_downloads.discard(key)
+    _detach_from_jobs(set(request.viewkeys))
     store.save()
     store.save_state()
     return {"removed": len(request.viewkeys)}
 
 
-@app.post("/api/downloads/remove")
-def remove_downloads(request: RemoveRequest) -> dict:
+def _detach_from_jobs(removed: set[str]) -> None:
+    """把删掉的任务从批次任务里剪掉，避免批次永远停在「运行中」。"""
+    if not removed:
+        return
+    scheduler.cancel(removed)
     with store.lock:
-        removed_keys = set(request.viewkeys)
         for job in store.jobs.values():
-            if job.kind == "download" and job.status in {"queued", "running"} and removed_keys.intersection(job.viewkeys):
+            if job.kind != "download" or not removed.intersection(job.viewkeys):
+                continue
+            # 同批任务只剪掉被删的那条，剩下的继续按队列下完
+            job.viewkeys = [key for key in job.viewkeys if key not in removed]
+            if not job.viewkeys and job.status in {"queued", "running"}:
                 job.cancelled = True
                 job.status = "failed"
                 job.error = "任务已删除"
-                for key in job.viewkeys:
-                    if key not in removed_keys:
-                        store.download_status[key] = {"state": "failed", "percent": 0, "error": "同批任务已被删除"}
-        for key in request.viewkeys:
+
+
+@app.post("/api/downloads/remove")
+def remove_downloads(request: RemoveRequest) -> dict:
+    removed = set(request.viewkeys)
+    _detach_from_jobs(removed)
+    with store.lock:
+        for key in removed:
             store.download_status.pop(key, None)
             store.dismissed_downloads.add(key)
     store.save_state()
@@ -1165,6 +1798,7 @@ def config_info() -> dict:
     return {
         "base_url": config.base_url,
         "categories": list(config.category_urls),
+        "profile": config.profile,
         "site_id": active.id if active else "",
         "sites": [entry.payload() for entry in book.snapshot()],
     }
@@ -1209,6 +1843,8 @@ def update_settings(request: AppSettings) -> dict:
 class SiteRequest(BaseModel):
     name: str = ""
     base_url: str
+    # 留空则按域名自动识别（含 pinse 关键字的走 91pinse 模板）
+    profile: str = ""
 
 
 class SiteSwitchRequest(BaseModel):
@@ -1273,7 +1909,7 @@ def list_sites() -> dict:
 def add_site(request: SiteRequest) -> dict:
     book = site_book()
     try:
-        entry = book.add(request.name, request.base_url)
+        entry = book.add(request.name, request.base_url, request.profile)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     return {"site": entry.payload(), "sites": [item.payload() for item in book.snapshot()], "active_id": book.active_id}
@@ -1300,6 +1936,10 @@ def switch_site(request: SiteSwitchRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     _rebind_cookies(entry.base_url)
+    # 切站点等于换了一整套页面结构：列表页快照必须清掉，否则新站点会拿着
+    # 旧站点的卡片去匹配详情页地址
+    _listing_snapshots.clear()
+    _listing_snapshot_locks.clear()
     return {
         "site": entry.payload(),
         "sites": [item.payload() for item in book.snapshot()],
@@ -1450,7 +2090,30 @@ def available_port(start: int = 8765) -> int:
     raise RuntimeError("没有可用的本地端口")
 
 
+def setup_logging() -> None:
+    """把下载日志同时写进 downloads/app.log：掉速时能翻到「哪条任务、为什么重连」。"""
+    root = logging.getLogger()
+    if getattr(root, "_viewkey_configured", False):
+        return
+    root.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%m-%d %H:%M:%S")
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            DATA_DIR / "app.log", maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+    except OSError:
+        pass
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    root.addHandler(console)
+    root._viewkey_configured = True  # type: ignore[attr-defined]
+
+
 def main() -> None:
+    setup_logging()
     port = int(os.getenv("VIEWKEY_PORT", "8765"))
     host = os.getenv("VIEWKEY_HOST", "127.0.0.1")
     if host == "127.0.0.1" and not os.getenv("VIEWKEY_PORT"):
@@ -1458,7 +2121,8 @@ def main() -> None:
     url = f"http://127.0.0.1:{port}"
     if os.getenv("VIEWKEY_NO_BROWSER", "0").lower() not in {"1", "true", "yes"}:
         Timer(1.2, lambda: webbrowser.open(url)).start()
-    Thread(target=resume_interrupted_downloads, daemon=True, name="viewkey-download-resume").start()
+    # 只做状态收尾，不自动开始任何下载：下载必须由用户在界面上手动触发
+    Thread(target=reconcile_download_state, daemon=True, name="viewkey-download-reconcile").start()
     print(f"91Fetch: {url}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
